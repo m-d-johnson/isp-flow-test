@@ -178,6 +178,18 @@ ICMP. Instead it walks the whole result and collects every answered probe's TTL 
 the address that answered it. That gives "TTL → addresses, and how many probe flows reached each",
 which is all the analysis needs.
 
+Failures are reported, never silent. scamper can return a well-formed result that carries an
+`errmsg` and sent no probes; `tracelb_error` treats that as an error. `tracelb_with_fallback`
+retries past two known failures:
+
+- **privsep race:** a plain retry. scamper creates `/var/empty` on first use, and parallel first
+  runs race to create it.
+- **TCP probes fail:** one retry with `udp-dport` (`MDA_FALLBACK_METHOD`). On macOS, scamper sends
+  TCP probes at the link layer and has to find the gateway's MAC address itself, which can fail
+  (`dlhdr_ethcb: did not get mac address`). UDP probes don't need it, and `udp-dport` still varies
+  the flow per probe; in the lab it finds the same two members as `tcp-sport`. The entry records
+  `fallback_from`, and the analysis and report say so.
+
 The raw scamper JSON is kept in `<phase>/mda/` for engineers who want the full detail.
 `analyse` cross-references load-balanced hops with the route-map suspects and the per-flow
 probes' slow path.
@@ -249,8 +261,9 @@ flow-report-<YYYYMMDD-HHMMSS>/
     long.json          [{target, family, mbps, series_mbps[], curl_rc, error, tcp_*, …}]
     iperf.json         [{host, family, direction, total_mbps, retransmits, streams[…], …}]
     flowtrace.json     {probes: [{family, sport, dport, dst, class, rep, hops[{ip, reached, rtt_ms}]}]}
-    mda.json           {method, results: [{target, family, ip, dport, hops[{ttl, addrs[{addr, flows}]}],
-                                           lb_hops[], width, file}]}
+    mda.json           {method, results: [{target, family, ip, dport, method, hops[{ttl, addrs[{addr, flows}]}],
+                                           lb_hops[], width, file, fallback_from{method, error}} |
+                                          {target, family, ip, dport, error}]}
     mda/*.json         raw scamper tracelb output
 ```
 
@@ -380,8 +393,8 @@ All actions are pinned to full commit SHAs, with the version in a comment. Depen
 
 ```sh
 # bump VERSION in isp-flow-test.py, commit, push, wait for CI to go green, then:
-git tag -a v3.2.0 -m v3.2.0
-git push origin v3.2.0
+git tag -a v3.2.1 -m v3.2.1
+git push origin v3.2.1
 ```
 
 `VERSION` is recorded in every `meta.json` and in the report footer, so you can tell which

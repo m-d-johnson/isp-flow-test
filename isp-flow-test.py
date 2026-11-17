@@ -89,7 +89,7 @@ import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 
 # name, IPv4 URL, IPv6 URL (None = target has no IPv6), role, note
 TARGETS = [
@@ -1751,8 +1751,20 @@ def parse_tracelb(obj):
             "width": max((len(h["addrs"]) for h in lb), default=1)}
 
 
+def tracelb_error(obj):
+    """scamper reports some failures inside an otherwise well-formed result: an errmsg, and no probes
+    sent. Those are errors, not 'no load balancing'."""
+    if obj.get("errmsg"):
+        return str(obj["errmsg"])[:200]
+    if not obj.get("probec"):
+        return "scamper sent no probes"
+    return None
+
+
 def run_tracelb(cap, ip, dport, method, timeout):
-    cmd = cap.prefix + ["scamper", "-O", "json", "-c", f"tracelb -P {method} -d {dport} -q 1 -w 1", "-i", ip]
+    """One scamper tracelb. Returns (result, None) or (None, error)."""
+    opts = f"-P {method} -q 1 -w 1" + (f" -d {dport}" if method.startswith("tcp") else "")
+    cmd = cap.prefix + ["scamper", "-O", "json", "-c", f"tracelb {opts}", "-i", ip]
     rc, out, err = run(cmd, timeout=timeout)
     for line in out.splitlines():
         try:
@@ -1760,8 +1772,30 @@ def run_tracelb(cap, ip, dport, method, timeout):
         except ValueError:
             continue
         if obj.get("type") == "tracelb":
-            return obj, None
+            problem = tracelb_error(obj)
+            return (None, problem) if problem else (obj, None)
     return None, (err or f"scamper rc={rc}, no tracelb result")[-200:]
+
+
+MDA_FALLBACK_METHOD = "udp-dport"
+
+
+def tracelb_with_fallback(cap, ip, dport, method, timeout):
+    """Run tracelb, retrying past two known failures. Returns (result, error, method actually used).
+    * scamper's privilege separation creates /var/empty on first use; parallel first runs race to
+      create it ("File exists"), and a plain retry succeeds.
+    * On macOS, scamper sends TCP probes at the link layer and has to find the gateway's MAC
+      address itself, which fails on some setups ("did not get mac address"). UDP probes don't
+      need it, and udp-dport still varies the flow identifier per probe, so MDA still works."""
+    obj, err = run_tracelb(cap, ip, dport, method, timeout)
+    if obj is None and "privsep" in (err or ""):
+        obj, err = run_tracelb(cap, ip, dport, method, timeout)
+    if obj is None and method.startswith("tcp"):
+        obj2, err2 = run_tracelb(cap, ip, dport, MDA_FALLBACK_METHOD, timeout)
+        if obj2 is not None:
+            return obj2, None, MDA_FALLBACK_METHOD, err
+        err = f"{err}; {MDA_FALLBACK_METHOD} fallback: {err2}"
+    return obj, err, method, None
 
 
 def mda_test(cap, thr_rows, families, args, meta, pdir):
@@ -1801,10 +1835,7 @@ def mda_test(cap, thr_rows, families, args, meta, pdir):
 
     def one(job):
         _, _, name, fam, ip, port = job
-        obj, err = run_tracelb(cap, ip, port, args.mda_method, args.mda_timeout)
-        if obj is None and "privsep" in (err or ""):      # see below; a retry after the race succeeds
-            obj, err = run_tracelb(cap, ip, port, args.mda_method, args.mda_timeout)
-        return job, obj, err
+        return (job,) + tracelb_with_fallback(cap, ip, port, args.mda_method, args.mda_timeout)
 
     def results():
         # The first trace runs alone: scamper's privilege separation creates its directory
@@ -1814,9 +1845,12 @@ def mda_test(cap, thr_rows, families, args, meta, pdir):
         with ThreadPoolExecutor(max_workers=3) as ex:
             yield from ex.map(one, jobs[1:])
 
-    for job, obj, err in results():
+    for job, obj, err, used, first_err in results():
         _, _, name, fam, ip, port = job
-        entry = {"target": name, "family": fam, "ip": ip, "dport": port}
+        entry = {"target": name, "family": fam, "ip": ip, "dport": port, "method": used}
+        if first_err:
+            entry["fallback_from"] = {"method": args.mda_method, "error": first_err}
+            say(f"     {name:<22} v{fam}  {args.mda_method} failed ({first_err[:60]}); used {used}")
         if obj is None:
             entry["error"] = err
             say(f"     {name:<22} v{fam}  error: {err[:80]}")
@@ -2050,6 +2084,13 @@ def load_phase(pdir):
         if os.path.exists(p):
             with open(p) as fh:
                 out[k] = json.load(fh)
+    for m in (out["mda"] or {}).get("results", []):     # 3.2.0 stored failed traces as empty results
+        if not m.get("hops") and not m.get("error") and m.get("file"):
+            try:
+                with open(os.path.join(pdir, m["file"])) as fh:
+                    m["error"] = tracelb_error(json.load(fh)) or "no hops recorded"
+            except (OSError, ValueError):
+                m["error"] = "no hops recorded"
     return out
 
 
@@ -2321,7 +2362,17 @@ def analyse(phases):
 
     # MDA: load-balanced hops, cross-referenced with the suspects found above
     for ph in res["phases"]:
-        mda = [m for m in (ph["P"]["mda"] or {}).get("results", []) if m.get("hops")]
+        allm = (ph["P"]["mda"] or {}).get("results", [])
+        mda = [m for m in allm if m.get("hops")]
+        failed = [m for m in allm if m.get("error")]
+        fell_back = [m for m in mda if m.get("fallback_from")]
+        if failed:
+            L.append(f"MDA traceroute ({ph['P']['meta']['short']}): {len(failed)} of {len(allm)} trace(s) failed, "
+                     f"e.g. {failed[0]['target']} v{failed[0]['family']}: {failed[0]['error']}.")
+        if fell_back:
+            fb = fell_back[0]["fallback_from"]
+            L.append(f"MDA traceroute ({ph['P']['meta']['short']}): {fb['method']} probes failed ({fb['error']}), so "
+                     f"{len(fell_back)} trace(s) used {MDA_FALLBACK_METHOD} probes, which also vary the flow per probe.")
         if not mda:
             continue
         suspects = set()
@@ -2946,6 +2997,8 @@ def html_report(an, args):
                      f"{esc(m['target'])} v{m['family']} — "
                      + (f"load-balanced at hop(s) {', '.join(map(str, m['lb_hops']))}, up to {m['width']} paths"
                         if m["lb_hops"] else "no load balancing seen")
+                     + (f" <span class='muted'>(via {esc(m['method'])}: {esc(m['fallback_from']['method'])} failed)</span>"
+                        if m.get("fallback_from") else "")
                      + "</summary><table><tr><th>Hop</th><th>Addresses (probe flows)</th></tr>")
             for h in m["hops"]:
                 cells = " · ".join(f"<code>{esc(a['addr'])}</code> ({a['flows']})"

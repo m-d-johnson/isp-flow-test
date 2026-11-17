@@ -228,3 +228,32 @@ def test_cli_help_and_report_only(tmp_path):
     r = subprocess.run([sys.executable, SCRIPT, "--report-only", str(tmp_path)], capture_output=True, text=True,
                        timeout=60)
     assert r.returncode == 0 and "No completed phases" in r.stdout
+
+
+def test_report_surfaces_mda_failures_and_fallbacks(ift, tmp_path):
+    out = tmp_path / "flow-report-mda"
+    pdir = write_phase(out, ift)
+    (pdir / "mda.json").write_text(json.dumps({"method": "tcp-sport", "results": [
+        {"target": "srv", "family": 4, "ip": "192.0.2.10", "dport": 80,
+         "error": "dlhdr_ethcb: did not get mac address for 192.0.2.1; udp-dport fallback: no route"},
+        {"target": "ctl", "family": 4, "ip": "192.0.2.20", "dport": 80, "method": "udp-dport",
+         "fallback_from": {"method": "tcp-sport", "error": "dlhdr_ethcb: did not get mac address"},
+         "hops": [{"ttl": 1, "addrs": [{"addr": "192.0.2.1", "flows": 6}]}], "lb_hops": [], "width": 1}]}))
+    ift.build_report(str(out), argparse.Namespace(ref="", name="Tester"))
+    summary = (out / "summary.txt").read_text()
+    assert "1 of 2 trace(s) failed" in summary and "did not get mac address" in summary
+    assert "used udp-dport probes" in summary
+    assert "(via udp-dport: tcp-sport failed)" in (out / "report.html").read_text()
+
+
+def test_report_only_repairs_silent_mda_failures_from_3_2_0(ift, tmp_path):
+    out = tmp_path / "flow-report-old"
+    pdir = write_phase(out, ift)
+    (pdir / "mda").mkdir()
+    (pdir / "mda" / "srv-v4.json").write_text(json.dumps(
+        {"type": "tracelb", "method": "tcp-sport", "probec": 0, "errmsg": "dlhdr_ethcb: did not get mac address"}))
+    (pdir / "mda.json").write_text(json.dumps({"method": "tcp-sport", "results": [
+        {"target": "srv", "family": 4, "ip": "192.0.2.10", "dport": 80, "dst": "192.0.2.10", "hops": [],
+         "lb_hops": [], "width": 1, "file": "mda/srv-v4.json"}]}))
+    ift.build_report(str(out), argparse.Namespace(ref="", name="Tester"))
+    assert "1 of 1 trace(s) failed" in (out / "summary.txt").read_text()

@@ -243,3 +243,57 @@ def test_budget(ift):
 def test_struct_sizes(ift):
     assert ift._TCPCI.size == 112 and ift._TCPI.size == 232
     assert struct.calcsize("<4B13I7Q") == 112
+
+
+# ---------------------------------------------------------------- scamper failures and the UDP fallback
+
+ERRMSG = {"type": "tracelb", "method": "tcp-sport", "dst": "192.0.2.80", "probec": 0, "nodec": 0, "linkc": 0,
+          "errmsg": "dlhdr_ethcb: did not get mac address for 192.0.2.1"}
+
+
+def lab_tracelb():
+    with open(os.path.join(FIXTURES, "tracelb-tcp-sport.json")) as fh:
+        return json.load(fh)
+
+
+def test_tracelb_error_detects_in_result_failures(ift):
+    assert "did not get mac address" in ift.tracelb_error(ERRMSG)
+    assert ift.tracelb_error({"type": "tracelb", "probec": 0}) == "scamper sent no probes"
+    assert ift.tracelb_error(lab_tracelb()) is None
+
+
+def test_run_tracelb_returns_errmsg_as_error(ift, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, timeout=30):
+        calls.append(cmd)
+        return 0, json.dumps({"type": "cycle-start"}) + "\n" + json.dumps(ERRMSG), ""
+    monkeypatch.setattr(ift, "run", fake_run)
+    cap = type("Cap", (), {"prefix": []})()
+    obj, err = ift.run_tracelb(cap, "192.0.2.80", 80, "tcp-sport", 10)
+    assert obj is None and "did not get mac address" in err
+    assert "-d 80" in calls[0][4]
+    ift.run_tracelb(cap, "192.0.2.80", 80, "udp-dport", 10)
+    assert "-d" not in calls[1][4].split()         # udp-dport keeps scamper's own base port
+
+
+@pytest.mark.parametrize("script, expect_method, expect_ok, expect_fallback", [
+    ([("ok", None)], "tcp-sport", True, False),
+    ([("err", "privsep: could not mkdir /var/empty: File exists"), ("ok", None)], "tcp-sport", True, False),
+    ([("err", "dlhdr_ethcb: did not get mac address"), ("ok", None)], "udp-dport", True, True),
+    ([("err", "dlhdr_ethcb: did not get mac address"), ("err", "no route")], "tcp-sport", False, False),
+])
+def test_tracelb_with_fallback(ift, monkeypatch, script, expect_method, expect_ok, expect_fallback):
+    seq, methods = list(script), []
+
+    def fake(cap, ip, dport, method, timeout):
+        methods.append(method)
+        kind, err = seq.pop(0)
+        return (lab_tracelb(), None) if kind == "ok" else (None, err)
+    monkeypatch.setattr(ift, "run_tracelb", fake)
+    obj, err, used, first_err = ift.tracelb_with_fallback(None, "192.0.2.80", 80, "tcp-sport", 10)
+    assert (obj is not None) == expect_ok and used == expect_method
+    assert bool(first_err) == expect_fallback
+    if not expect_ok:
+        assert "did not get mac address" in err and "udp-dport fallback: no route" in err
+    assert not seq
