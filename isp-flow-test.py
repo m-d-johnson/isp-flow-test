@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["rich>=13", "scapy>=2.5"]
+# dependencies = ["rich>=13", "scapy>=2.5", "certifi", 'truststore>=0.9; python_version >= "3.10"']
 # ///
 """
 isp-flow-test.py — guided test for "some connections are fast, others crawl" on a broadband line.
@@ -21,28 +21,34 @@ prompting between each:
 
 Per vantage point it collects:
   * per-connection throughput: fresh, sequential TCP connections (default 16 rounds x 5 s),
-    interleaved across targets so that changes over time affect every target equally
+    interleaved across targets so that changes over time affect every target equally, each with
+    the kernel's own TCP statistics (receive-side RTT, out-of-order share)
   * a fixed-source-port test: re-uses the same local ports several times. If outcomes stick to
     the port, the fault follows a flow hash (LAG/ECMP member); if they don't, it's random
   * packet captures (tcpdump, headers only; needs sudo once) of single downloads, analysed for
-    retransmissions, holes, SACKs and stalls; slow captures and one fast one are kept as .pcap
+    retransmissions, holes, SACKs and stalls, and cross-checked by tshark when installed; slow
+    captures and one fast one are kept as .pcap
   * long-running connections (default 4 x 30 s) with throughput sampled every second, to show
     whether a slow connection ever recovers
   * a parallel-stream test (iperf3, 16 streams, both directions) against public servers; needs
     `brew install iperf3`, otherwise it's skipped
   * traceroutes (3 probes per hop) with reverse DNS, origin AS and internet-exchange hops
-    flagged, merged into a ROUTE MAP that colours every router by the share of slow connections
+    flagged (every exchange in PeeringDB, with the member network), merged into a ROUTE MAP that colours every router by the share of slow connections
     through it and highlights routers found only on bad routes
   * per-flow path probes: TCP traceroutes (scapy, needs sudo) sent with the exact source ports
     that were consistently slow or fast, to show where the bad and good paths part
+  * MDA traceroute (scamper, needs sudo): every load-balanced path to the most-affected
+    destinations, cross-referenced with the suspects
   * ping loss/RTT to every destination, and forward DNS for every target
 
 It then aggregates everything into one folder and a .zip for the ISP's support team:
   report.html (self-contained, open in any browser), summary.txt, message.txt (a draft
   message with the automatic analysis appended at the bottom), README.txt and raw data.
 
-Drives curl, traceroute/traceroute6, ping/ping6, whois, tcpdump and iperf3. Rich (progress
-display) and scapy (path probes) are optional; `uv run` installs both. Written for macOS.
+Downloads use the script's own HTTP client, so it can read each socket's TCP statistics. It
+drives traceroute/traceroute6, ping/ping6, whois, curl (public IP), tcpdump, and optionally
+iperf3, scamper and tshark. Rich, scapy and truststore/certifi are optional; `uv run` installs
+them. Written for macOS; runs on Linux with --force.
 
 Usage:
   ./isp-flow-test.py                            # asks which vantage points (default: ISP router, wired)
@@ -56,6 +62,7 @@ Usage:
 import argparse
 import csv
 import datetime as dt
+import errno
 import getpass
 import html
 import ipaddress
@@ -69,6 +76,7 @@ import select
 import shutil
 import signal
 import socket
+import ssl
 import statistics
 import struct
 import subprocess
@@ -76,10 +84,12 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 # name, IPv4 URL, IPv6 URL (None = target has no IPv6), role, note
 TARGETS = [
@@ -118,7 +128,6 @@ TARGETS = [
      "https://fsn1-speed.hetzner.com/1GB.bin", "https://fsn1-speed.hetzner.com/1GB.bin",
      "probe", "Hetzner speed-test server, Falkenstein, Germany"),
 ]
-TARGET_NAMES = [t[0] for t in TARGETS]
 PORT_TEST_TARGET = "hetzner-ash-http"   # also used by the packet-capture and long-connection tests
 
 # Internet-exchange peering LANs: a traceroute hop inside one means the path peers there.
@@ -127,8 +136,10 @@ IX_PREFIXES = [
     ("LINX", "195.66.224.0/22"), ("LINX", "195.66.236.0/22"), ("LINX", "2001:7f8:4::/48"),
     ("LONAP", "5.57.80.0/22"), ("LONAP", "2001:7f8:17::/48"),
 ]
-IX_NETS = [(n, ipaddress.ip_network(p)) for n, p in IX_PREFIXES]
-IX_LABEL = ", ".join(sorted({n for n, _ in IX_PREFIXES}))
+# Replaced at start-up by every exchange prefix in PeeringDB when it can be fetched (see load_ix_table)
+IX_TABLE = {"nets": [(n, ipaddress.ip_network(p)) for n, p in IX_PREFIXES],
+            "source": "built-in list (" + ", ".join(sorted({n for n, _ in IX_PREFIXES})) + ")", "pdb": False}
+PDB_API = "https://www.peeringdb.com/api"
 
 # Public iperf3 servers (host, first port, last port, note). Busy ports are skipped.
 IPERF_SERVERS = [
@@ -181,7 +192,10 @@ CURL_FMT = ("%{http_code}|%{remote_ip}|%{local_port}|%{time_connect}|%{time_appc
 VPN_IFACE_PREFIXES = ("utun", "ppp", "ipsec", "tun", "tap", "wg")
 FLOW_FIELDS = ["phase", "test", "round", "target", "role", "family", "requested_port", "class", "mbps",
                "bytes", "http_code", "remote_ip", "local_port", "t_connect", "t_tls", "t_ttfb", "t_total",
-               "curl_rc", "error", "time"]
+               "curl_rc", "error", "time",
+               # kernel TCP statistics for the connection, read just before it closed (see tcp_stats)
+               "tcp_rtt_ms", "tcp_rttvar_ms", "tcp_min_rtt_ms", "tcp_ooo_pct", "tcp_rx_packets", "tcp_mss"]
+TCP_FIELDS = [f for f in FLOW_FIELDS if f.startswith("tcp_")]
 
 
 # ---------------------------------------------------------------- helpers
@@ -377,7 +391,7 @@ class UI:
                           f"[red]{slow_txt}[/]" if st["slow"] else f"[green]{slow_txt}[/]",
                           num(st["med_fast"], ".1f"), num(st["med_slow"], ".2f"))
         self.console.print(t)
-        self.console.print(Panel("\n".join(f"• {l}" for l in an["lines"]), title="Analysis", border_style="cyan"))
+        self.console.print(Panel("\n".join(f"• {line}" for line in an["lines"]), title="Analysis", border_style="cyan"))
         body = "\n".join(f"[bold]{k:<8}[/] {v}" for k, v in files)
         self.console.print(Panel(body, title="Support package", border_style="green"))
 
@@ -409,6 +423,8 @@ def phase_seconds(args, nfam):
         s += nfam * min(args.pcap_flows, 6) * (args.pcap_seconds + 3)
     if not args.no_flowtrace and not args.no_port_test:
         s += nfam * 4 * args.flowtrace_ports * 5
+    if not args.no_mda and shutil.which("scamper"):
+        s += math.ceil(args.mda_max * nfam / 3) * 60
     if not args.no_long:
         s += nfam * args.long_count * (args.long_seconds + 2)
     if not args.no_iperf:
@@ -417,6 +433,10 @@ def phase_seconds(args, nfam):
 
 
 def default_route(family):
+    if platform.system() != "Darwin":
+        rc, out, _ = run(["ip", f"-{family}", "route", "show", "default"], timeout=5)
+        m = re.search(r"default via (\S+) dev (\S+)", out or "")
+        return (m.group(1), m.group(2)) if m else (None, None)
     cmd = ["route", "-n", "get"] + (["-inet6"] if family == 6 else []) + ["default"]
     rc, out, _ = run(cmd, timeout=5)
     if rc != 0:
@@ -517,7 +537,7 @@ def asn_lookup(ip):
     res = {}
     if is_public(ip) and shutil.which("whois"):
         rc, out, _ = run(["whois", "-h", "whois.cymru.com", f" -v {ip}"], timeout=12)
-        lines = [l for l in out.splitlines() if "|" in l and not l.lower().startswith("as ")]
+        lines = [ln for ln in out.splitlines() if "|" in ln and not ln.lower().startswith("as ")]
         if lines:
             f = [x.strip() for x in lines[-1].split("|")]
             if len(f) >= 7:
@@ -546,9 +566,17 @@ def url_for(target, family):
     return target[1] if family == 4 else target[2]
 
 
+def trace_owner(tname, fam):
+    """Targets on the same host share one traceroute; the first of them in TARGETS owns it."""
+    t = next((x for x in TARGETS if x[0] == tname), None)
+    u = url_for(t, fam) if t else None
+    if not u:
+        return tname
+    return next((x[0] for x in TARGETS if url_for(x, fam) and host_of(url_for(x, fam)) == host_of(u)), tname)
+
+
 def trace_key(tname, fam):
-    """Traceroute key for a target (the HTTPS Hetzner target shares the HTTP one's host)."""
-    return f"{'hetzner-ash-http' if tname == 'hetzner-ash-https' else tname}/v{fam}"
+    return f"{trace_owner(tname, fam)}/v{fam}"
 
 
 def route_class(traces, tname, fam):
@@ -615,13 +643,19 @@ def check_env(phase_id, env, args, seen):
 
 
 def wait_for_network(timeout=90):
+    """Wait until a TCP connection to one of the first few targets succeeds."""
+    hosts = []
+    for t in TARGETS[:4]:
+        u = urllib.parse.urlsplit(t[1] or t[2])
+        hosts.append((u.hostname, u.port or (443 if u.scheme == "https" else 80)))
     t0 = time.time()
     while time.time() - t0 < timeout:
-        gw, _ = default_route(4)
-        if gw or platform.system() != "Darwin":
-            rc, out, _ = run(["curl", "-s", "-4", "-m", "4", "https://api.ipify.org"], timeout=8)
-            if rc == 0 and out:
+        for h in hosts:
+            try:
+                socket.create_connection(h, timeout=4).close()
                 return True
+            except OSError:
+                pass
         time.sleep(3)
     return False
 
@@ -641,31 +675,255 @@ def ask(prompt, choices, default, interactive):
 
 # ---------------------------------------------------------------- measurements
 
-def one_flow(url, family, seconds, local_port=None):
+_TLS = {}
+
+
+def tls_context():
+    """Certificate verification that works on a uv-managed Python too, whose OpenSSL may not find the
+    system's CA bundle: the OS trust store via truststore (3.10+), else certifi, else the default."""
+    if "ctx" not in _TLS:
+        ctx = None
+        try:
+            import truststore
+            ctx = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        except Exception:                                     # any failure: try the next
+            try:
+                import certifi
+                ctx = ssl.create_default_context(cafile=certifi.where())
+            except ImportError:
+                ctx = ssl.create_default_context()
+        _TLS["ctx"] = ctx
+    return _TLS["ctx"]
+
+
+def http_get_json(url, timeout=30, headers=None):
+    req = urllib.request.Request(url, headers={"User-Agent": f"isp-flow-test/{VERSION}",
+                                               "Accept": "application/json", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout, context=tls_context()) as r:
+        return json.load(r)
+
+
+# macOS: struct tcp_connection_info (<netinet/tcp.h>, TCP_CONNECTION_INFO = 0x106), 112 bytes
+TCP_CONNECTION_INFO = 0x106
+_TCPCI = struct.Struct("<4B13I7Q")
+# Linux: struct tcp_info (<linux/tcp.h>) up to tcpi_snd_wnd, 232 bytes. Older kernels return a
+# shorter struct, so each field's end offset is kept and fields past the returned length are skipped.
+_TCPI_SPEC = ([(n, "B") for n in ("state", "ca_state", "retransmits", "probes", "backoff", "options",
+                                  "wscale", "flags")]
+              + [(n, "I") for n in ("rto", "ato", "snd_mss", "rcv_mss", "unacked", "sacked", "lost", "retrans",
+                                    "fackets", "last_data_sent", "last_ack_sent", "last_data_recv",
+                                    "last_ack_recv", "pmtu", "rcv_ssthresh", "rtt", "rttvar", "snd_ssthresh",
+                                    "snd_cwnd", "advmss", "reordering", "rcv_rtt", "rcv_space", "total_retrans")]
+              + [(n, "Q") for n in ("pacing_rate", "max_pacing_rate", "bytes_acked", "bytes_received")]
+              + [(n, "I") for n in ("segs_out", "segs_in", "notsent_bytes", "min_rtt", "data_segs_in",
+                                    "data_segs_out")]
+              + [(n, "Q") for n in ("delivery_rate", "busy_time", "rwnd_limited", "sndbuf_limited")]
+              + [(n, "I") for n in ("delivered", "delivered_ce")]
+              + [(n, "Q") for n in ("bytes_sent", "bytes_retrans")]
+              + [(n, "I") for n in ("dsack_dups", "reord_seen", "rcv_ooopack", "snd_wnd")])
+_TCPI = struct.Struct("<" + "".join(f for _, f in _TCPI_SPEC))
+_TCPI_END = {}
+for _i in range(len(_TCPI_SPEC)):
+    _TCPI_END[_TCPI_SPEC[_i][0]] = struct.calcsize("<" + "".join(f for _, f in _TCPI_SPEC[:_i + 1]))
+
+
+def parse_tcp_connection_info(raw):
+    """macOS receive-side view of one connection. Out-of-order share is by bytes."""
+    if len(raw) < _TCPCI.size:
+        return {}
+    v = _TCPCI.unpack(raw[:_TCPCI.size])
+    (_state, _sws, _rws, _pad, options, flags, rto, maxseg, _ssthresh, _cwnd, _swnd, _sbbytes, rcv_wnd,
+     _rttcur, srtt, rttvar, _bits, _txp, _txb, _txrb, rxp, rxb, rxooo, _txrp) = v
+    return {"tcp_rtt_ms": srtt, "tcp_srtt_ms": srtt, "tcp_rttvar_ms": rttvar, "tcp_rto_ms": rto, "tcp_mss": maxseg,
+            "tcp_rx_packets": rxp, "tcp_rx_bytes": rxb, "tcp_rx_ooo_bytes": rxooo,
+            "tcp_ooo_pct": round(100.0 * rxooo / rxb, 3) if rxb else None, "tcp_rcv_wnd": rcv_wnd,
+            "tcp_sack": bool(options & 2), "tcp_reordering_detected": bool(flags & 2)}
+
+
+def parse_tcp_info_linux(raw):
+    """Linux receive-side view of one connection. Out-of-order share is by packets (kernel 5.4+)."""
+    if len(raw) < _TCPI_END["total_retrans"]:
+        return {}
+    v = dict(zip((n for n, _ in _TCPI_SPEC), _TCPI.unpack(raw[:_TCPI.size].ljust(_TCPI.size, b"\0"))))
+
+    def have(field):
+        return len(raw) >= _TCPI_END[field]
+
+    # tcpi_rtt only measures this end's own (ACK-only) transmissions on a download; tcpi_rcv_rtt is
+    # the receiver's estimate and is the one that reflects the data path's queueing
+    rtt = v["rcv_rtt"] or v["rtt"]
+    out = {"tcp_rtt_ms": round(rtt / 1000, 3), "tcp_srtt_ms": round(v["rtt"] / 1000, 3), "tcp_rttvar_ms": round(v["rttvar"] / 1000, 3),
+           "tcp_rto_ms": round(v["rto"] / 1000, 3), "tcp_mss": v["rcv_mss"],
+           "tcp_rcv_rtt_ms": round(v["rcv_rtt"] / 1000, 3)}
+    if have("bytes_received"):
+        out["tcp_rx_bytes"] = v["bytes_received"]
+    if have("data_segs_in"):
+        out["tcp_min_rtt_ms"] = round(v["min_rtt"] / 1000, 3)
+        out["tcp_rx_packets"] = v["data_segs_in"]
+    if have("reord_seen"):
+        out["tcp_reord_seen"] = v["reord_seen"]
+    if have("rcv_ooopack"):
+        out["tcp_rx_ooo_packets"] = v["rcv_ooopack"]
+        out["tcp_ooo_pct"] = round(100.0 * v["rcv_ooopack"] / v["data_segs_in"], 3) if v["data_segs_in"] else None
+    return out
+
+
+def tcp_stats(sock):
+    """The kernel's own statistics for a connected TCP socket (TLS sockets too); {} if unavailable."""
+    try:
+        if sys.platform == "darwin":
+            return parse_tcp_connection_info(sock.getsockopt(socket.IPPROTO_TCP, TCP_CONNECTION_INFO, _TCPCI.size))
+        if sys.platform.startswith("linux"):
+            return parse_tcp_info_linux(sock.getsockopt(socket.IPPROTO_TCP, getattr(socket, "TCP_INFO", 11),
+                                                        _TCPI.size))
+    except OSError:
+        pass
+    return {}
+
+
+def _read_head(sock, deadline):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        sock.settimeout(max(deadline - time.monotonic(), 0.05))
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("connection closed before the response headers")
+        data += chunk
+        if len(data) > 262144:
+            raise ValueError("response headers too large")
+    head, _, rest = data.partition(b"\r\n\r\n")
+    lines = head.decode("iso-8859-1").split("\r\n")
+    parts = lines[0].split(" ", 2)
+    status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    headers = {}
+    for line in lines[1:]:
+        k, _, v = line.partition(":")
+        headers[k.strip().lower()] = v.strip()
+    return status, headers, rest, len(head) + 4
+
+
+def http_flow(url, family, seconds, local_port=None, sample=False):
+    """One HTTP(S) GET on a socket this process owns, for at most `seconds` in total. Throughput counts
+    only the body after the first response byte. Returns curl-compatible exit codes (0 complete,
+    28 time limit reached — normal, 6 DNS, 7 connect, 35 TLS, 45 bind/port in use, 47 redirects,
+    56 receive error) so results stay comparable with earlier versions, plus the kernel's TCP
+    statistics for the connection and, with sample=True, per-second throughput."""
     BUDGET.check()
-    cmd = ["curl", "-sL", f"-{family}", "--max-time", str(seconds), "-o", os.devnull, "-w", CURL_FMT]
-    if local_port:
-        cmd += ["--local-port", str(local_port)]
-    cmd.append(url)
-    for attempt in range(3):
-        rc, out, err = run(cmd, timeout=seconds + 20)
-        if not (local_port and rc == 45):        # 45 = couldn't bind: port still in TIME_WAIT; wait it out
+    af = socket.AF_INET6 if family == 6 else socket.AF_INET
+    t0 = time.monotonic()
+    deadline = t0 + seconds
+    rec = {"curl_rc": 0, "error": "", "requested_port": local_port or "", "http_code": "000", "remote_ip": "",
+           "local_port": "", "t_connect": 0.0, "t_tls": 0.0, "t_ttfb": 0.0, "t_total": 0.0, "bytes": 0,
+           "mbps": 0.0, "series_mbps": []}
+    sock = None
+
+    def fail(rc, msg):
+        rec.update(curl_rc=rc, error=msg[:200], t_total=round(time.monotonic() - t0, 3))
+        if sock is not None:
+            sock.close()
+        return rec
+
+    try:
+        for _hop in range(6):
+            u = urllib.parse.urlsplit(url)
+            https = u.scheme == "https"
+            port = u.port or (443 if https else 80)
+            try:
+                addr = socket.getaddrinfo(u.hostname, port, af, socket.SOCK_STREAM)[0][4]
+            except socket.gaierror as e:
+                return fail(6, f"DNS: {e}")
+            sock = socket.socket(af, socket.SOCK_STREAM)
+            sock.settimeout(max(deadline - time.monotonic(), 0.5))
+            if local_port:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    sock.bind(("::" if family == 6 else "0.0.0.0", local_port))
+                except OSError as e:
+                    return fail(45, f"bind to port {local_port}: {e}")
+            try:
+                sock.connect(addr)
+            except socket.timeout:
+                return fail(28, "connect timed out")
+            except OSError as e:       # a fixed port whose previous connection is still in TIME_WAIT
+                return fail(45 if e.errno in (errno.EADDRINUSE, errno.EADDRNOTAVAIL) else 7, f"connect: {e}")
+            rec.update(t_connect=round(time.monotonic() - t0, 4), remote_ip=addr[0],
+                       local_port=sock.getsockname()[1])
+            if https:
+                try:
+                    sock = tls_context().wrap_socket(sock, server_hostname=u.hostname)
+                except (ssl.SSLError, socket.timeout, OSError) as e:
+                    return fail(35, f"TLS: {e}")
+                rec["t_tls"] = round(time.monotonic() - t0, 4)
+            path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+            req = (f"GET {path} HTTP/1.1\r\nHost: {u.netloc}\r\nUser-Agent: isp-flow-test/{VERSION}\r\n"
+                   "Accept: */*\r\nConnection: close\r\n\r\n")
+            try:
+                sock.sendall(req.encode())
+                status, headers, body0, head_len = _read_head(sock, deadline)
+            except socket.timeout:
+                return fail(28, "no response before the time limit")
+            except (OSError, ValueError) as e:
+                return fail(56, f"response: {e}")
+            first = time.monotonic()
+            rec.update(t_ttfb=round(first - t0, 4), http_code=str(status))
+            BUDGET.add(head_len)
+            if status in (301, 302, 303, 307, 308) and headers.get("location"):
+                url = urllib.parse.urljoin(url, headers["location"])
+                sock.close()
+                sock = None
+                continue
+            break
+        else:
+            return fail(47, "too many redirects")
+
+        clen = int(headers["content-length"]) if headers.get("content-length", "").isdigit() else -1
+        buf = memoryview(bytearray(1 << 20))
+        n, rc, buckets = len(body0), 0, {0: len(body0)}
+        while clen < 0 or n < clen:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                rc = 28
+                break
+            sock.settimeout(left)
+            try:
+                k = sock.recv_into(buf)
+            except socket.timeout:
+                rc = 28
+                break
+            except OSError as e:
+                rc = 56
+                rec["error"] = f"receive: {e}"[:200]
+                break
+            if k == 0:
+                break
+            n += k
+            if sample:
+                sec = int(time.monotonic() - first)
+                buckets[sec] = buckets.get(sec, 0) + k
+        t_end = time.monotonic()
+        rec.update(tcp_stats(sock))
+        BUDGET.add(n)
+        xfer = max(t_end - first, 0.001)
+        rec.update(curl_rc=rc, bytes=n, t_total=round(t_end - t0, 3), mbps=round(n / xfer / 1e6, 3))
+        if sample:      # whole seconds only: a final partial second would read low
+            rec["series_mbps"] = [round(buckets.get(i, 0) / 1e6, 3) for i in range(int(xfer))]
+        if not rec["error"] and (rc not in (0, 28) or rec["http_code"] not in ("200", "206") or n == 0):
+            rec["error"] = f"rc={rc} http={rec['http_code']} bytes={n}"
+        return rec
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def one_flow(url, family, seconds, local_port=None):
+    for _attempt in range(3):
+        rec = http_flow(url, family, seconds, local_port)
+        if not (local_port and rec["curl_rc"] == 45):     # fixed port still in TIME_WAIT: wait it out
             break
         time.sleep(15)
-    rec = {"curl_rc": rc, "error": "", "requested_port": local_port or ""}
-    parts = out.split("|")
-    if len(parts) != 8:
-        rec.update(http_code="000", remote_ip="", local_port="", t_connect=0.0, t_tls=0.0, t_ttfb=0.0,
-                   t_total=0.0, bytes=0, mbps=0.0, error=err or f"curl rc={rc}")
-        return rec
-    code, rip, lport, tc, ta, tf, tt, size = parts
-    tc, ta, tf, tt, size = float(tc), float(ta), float(tf), float(tt), int(float(size))
-    BUDGET.add(size)
-    xfer = max(tt - tf, 0.001)          # body time only: excludes DNS/TCP/TLS/redirects
-    rec.update(http_code=code, remote_ip=rip, local_port=lport, t_connect=round(tc, 4), t_tls=round(ta, 4),
-               t_ttfb=round(tf, 4), t_total=round(tt, 3), bytes=size, mbps=round(size / xfer / 1e6, 3))
-    if rc not in (0, 28) or code not in ("200", "206") or size == 0:   # rc 28 = hit --max-time (normal)
-        rec["error"] = err or f"curl rc={rc} http={code}"
     return rec
 
 
@@ -709,18 +967,106 @@ def traceroute(host, family):
         return {"error": f"{tool} not available", "hops": []}
     rc, out, err = run([tool, "-n", "-q", "3", "-w", "1", "-m", "18", host], timeout=150)
     hops = parse_traceroute(out)
-    via_ix = None
+    via_ix = via_member = None
     for h in hops:
         h["alts"] = []
         for k, ip in enumerate(h.get("ips") or []):
             info = {"ip": ip, "rdns": rdns(ip), "ix": ix_name(ip)}
             info.update(asn_lookup(ip))
+            if info["ix"]:
+                info.update(ix_member(ip))
+                via_member = via_member or member_label(info) or None
             via_ix = via_ix or info["ix"]
             if k == 0:
                 h.update({k2: v for k2, v in info.items() if k2 != "ip"})
             else:
                 h["alts"].append(info)
-    return {"raw": out or err, "hops": hops, "via_ix": via_ix}
+    return {"raw": out or err, "hops": hops, "via_ix": via_ix, "via_ix_member": via_member}
+
+
+def cache_dir():
+    return os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "isp-flow-test")
+
+
+def _pdb_headers():
+    key = os.environ.get("PEERINGDB_API_KEY")
+    return {"Authorization": f"Api-Key {key}"} if key else {}
+
+
+def load_ix_table(use_pdb=True, max_age=86400):
+    """Every internet-exchange peering LAN in PeeringDB (ixpfx -> ixlan -> ix), cached for a day.
+    Falls back to a stale cache, then to the built-in IX_PREFIXES."""
+    path = os.path.join(cache_dir(), "peeringdb-ix.json")
+    cached = None
+    try:
+        with open(path) as fh:
+            cached = json.load(fh)
+    except (OSError, ValueError):
+        pass
+    if use_pdb and not (cached and time.time() - cached.get("fetched", 0) < max_age):
+        try:
+            h = _pdb_headers()
+            ix = {d["id"]: d["name"] for d in http_get_json(f"{PDB_API}/ix?depth=0&fields=id,name", headers=h)["data"]}
+            lan = {d["id"]: d["ix_id"] for d in http_get_json(f"{PDB_API}/ixlan?depth=0&fields=id,ix_id",
+                                                              headers=h)["data"]}
+            pfx = [[ix.get(lan.get(d["ixlan_id"]), f"IX LAN {d['ixlan_id']}"), d["prefix"]]
+                   for d in http_get_json(f"{PDB_API}/ixpfx?depth=0&fields=ixlan_id,prefix", headers=h)["data"]]
+            if len(pfx) < 100:
+                raise ValueError(f"only {len(pfx)} prefixes")
+            cached = {"fetched": time.time(), "prefixes": pfx}
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + ".tmp", "w") as fh:
+                json.dump(cached, fh)
+            os.replace(path + ".tmp", path)
+        except (OSError, ValueError, KeyError) as e:
+            say(f"  PeeringDB unavailable ({str(e)[:80]}); " + ("using cached exchange list." if cached else
+                                                               "using the built-in exchange list."))
+    if not (use_pdb and cached):
+        return
+    nets = []
+    for name, p in cached["prefixes"]:
+        try:
+            nets.append((name, ipaddress.ip_network(p, strict=False)))
+        except ValueError:
+            continue
+    when = dt.datetime.fromtimestamp(cached["fetched"]).strftime("%Y-%m-%d")
+    IX_TABLE.update(nets=nets, source=f"PeeringDB, {len(nets)} prefixes, fetched {when}", pdb=True)
+
+
+_IXM = {}
+
+
+def ix_member(ip):
+    """Which network owns an address on an exchange's peering LAN (PeeringDB netixlan)."""
+    if ip in _IXM:
+        return _IXM[ip]
+    res = {}
+    if IX_TABLE["pdb"]:
+        try:
+            key = "ipaddr6" if ":" in ip else "ipaddr4"
+            d = http_get_json(f"{PDB_API}/netixlan?{key}={urllib.parse.quote(ip)}&fields=asn,net_id,name",
+                              timeout=10, headers=_pdb_headers())["data"]
+            if d:
+                res = {"ix_member_asn": d[0].get("asn"), "ix_lan": d[0].get("name", "")}
+                net = http_get_json(f"{PDB_API}/net?id={d[0]['net_id']}&fields=id,name", timeout=10,
+                                    headers=_pdb_headers())["data"]
+                if net:
+                    res["ix_member"] = net[0].get("name", "")
+        except (OSError, ValueError, KeyError, IndexError):
+            pass
+    _IXM[ip] = res
+    return res
+
+
+def member_label(info):
+    if not info.get("ix_member_asn"):
+        return ""
+    return f"AS{info['ix_member_asn']}" + (f" {info['ix_member']}" if info.get("ix_member") else "")
+
+
+def ix_source(an):
+    srcs = [ph["P"]["meta"].get("ix_source") for ph in an["phases"] if ph["P"]["meta"].get("ix_source")]
+    return srcs[0] if srcs else "built-in list"
 
 
 def ix_name(ip):
@@ -728,7 +1074,7 @@ def ix_name(ip):
         a = ipaddress.ip_address(ip.split("%")[0])
     except ValueError:
         return None
-    return next((n for n, net in IX_NETS if a.version == net.version and a in net), None)
+    return next((n for n, net in IX_TABLE["nets"] if a.version == net.version and a in net), None)
 
 
 _ISP_ASN = {"asn": ""}     # AS number of the public IPv4 address, set by detect_env / load_phase
@@ -765,7 +1111,8 @@ def path_label(tr, traces=None):
     if not tr or not tr.get("hops"):
         return "unknown"
     if tr.get("via_ix"):
-        return f"public peering at {tr['via_ix']}"
+        return f"public peering at {tr['via_ix']}" + (f", handed to {tr['via_ix_member']}"
+                                                         if tr.get("via_ix_member") else "")
     asns = [(h["asn"], h.get("as_name", "")) for h in tr["hops"] if h.get("asn") and h.get("asn") != "NA"]
     home = home_asns(traces)
     ext = [name.split(",")[0] for asn, name in asns if asn not in home]
@@ -1037,6 +1384,10 @@ def pcap_test(cap, phase_id, pdir, env, families, args):
                 os.replace(tmp, final)
                 entry["file"] = os.path.relpath(final, pdir)
                 entry.update(analyse_pcap(final, info["port"]))
+                if not args.no_tshark:
+                    ts = tshark_analyse(final, info["port"])
+                    if ts:
+                        entry["tshark"] = ts
                 kept_fast |= cls == "fast"
                 n_slow += cls == "slow"
             elif os.path.exists(tmp):
@@ -1055,50 +1406,9 @@ def pcap_test(cap, phase_id, pdir, env, families, args):
 
 # ---------------------------------------------------------------- 5. long-running connections
 
-_SUFFIX = {"": 1, "k": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
-
-
-def _bytes(tok):
-    m = re.match(r"^([\d.]+)([kMGT]?)$", tok)
-    return float(m.group(1)) * _SUFFIX[m.group(2)] if m else None
-
-
-def _secs(tok):
-    p = tok.split(":")
-    return int(p[0]) * 3600 + int(p[1]) * 60 + int(p[2]) if len(p) == 3 and all(x.isdigit() for x in p) else None
-
-
 def long_flow(url, family, seconds):
-    """One download for `seconds`, with throughput sampled every second from curl's progress meter."""
-    BUDGET.check()
-    cmd = ["curl", "-L", f"-{family}", "--max-time", str(seconds), "-o", os.devnull,
-           "-w", "%{remote_ip}|%{size_download}|%{time_starttransfer}|%{time_total}|%{http_code}", url]
-    rc, out, err = run(cmd, timeout=seconds + 30)
-    samples = {}
-    for line in err.replace("\r", "\n").splitlines():
-        f = line.split()
-        if len(f) >= 12 and f[0].isdigit():
-            b, t = _bytes(f[3]), _secs(f[9])
-            if b is not None and t is not None:
-                samples[t] = b
-    series, prev_t, prev_b = [], 0, 0.0
-    for t in sorted(samples):
-        if t <= prev_t:
-            continue
-        series.append(round((samples[t] - prev_b) / (t - prev_t) / 1e6, 3))
-        prev_t, prev_b = t, samples[t]
-    if len(series) > 2 and rc == 28:
-        series = series[:-1]          # last sample is a partial second cut off by --max-time: not real
-    parts = out.split("|")
-    rec = {"curl_rc": rc, "series_mbps": series}
-    if len(parts) == 5:
-        rip, size, tf, tt, code = parts
-        size, tf, tt = int(float(size)), float(tf), float(tt)
-        BUDGET.add(size)
-        rec.update(remote_ip=rip, bytes=size, http_code=code, mbps=round(size / max(tt - tf, 0.001) / 1e6, 3))
-    else:
-        rec.update(remote_ip="", bytes=0, http_code="000", mbps=0.0, error=err[-200:])
-    return rec
+    """One download for `seconds`, with throughput in each whole second."""
+    return http_flow(url, family, seconds, sample=True)
 
 
 def long_test(families, args):
@@ -1240,7 +1550,7 @@ def flowtrace_worker(spec):
                                  window=65535))
         try:
             ans, _ = sr(pkts, timeout=spec["timeout"], inter=0.02, multi=True, verbose=0)
-        except Exception as e:                        # noqa: BLE001 — report, don't crash the run
+        except Exception as e:                        # report, don't crash the run
             out.append(dict(pr, error=str(e)[:200], hops=[]))
             continue
         sent = {}
@@ -1345,7 +1655,7 @@ def flowtrace_analysis(ft):
             continue
         L = max(len(p["hops"]) for p in ps)
 
-        def ips(cls, i):
+        def ips(cls, i, ps=ps):
             return {(p["hops"][i] or {}).get("ip") for p in ps if p["class"] == cls and i < len(p["hops"])} - {None}
         diverge = None
         for i in range(L):
@@ -1361,6 +1671,157 @@ def flowtrace_analysis(ft):
                     "reached": sum(1 for p in ps if p["hops"] and (p["hops"][-1] or {}).get("reached")),
                     "n": len(ps)}
     return out
+
+
+# ---------------------------------------------------------------- tshark cross-check of captures
+
+TSHARK_FLAGS = ("retransmission", "fast_retransmission", "spurious_retransmission", "out_of_order", "lost_segment")
+
+
+def parse_tshark_fields(out, local_port):
+    """Count Wireshark's TCP analysis flags on the server's data segments (to local_port) and the
+    duplicate ACKs we sent. Lines: dstport,len,<TSHARK_FLAGS...>,duplicate_ack; flags print as 1."""
+    res = {f: 0 for f in TSHARK_FLAGS}
+    res.update(data_segments=0, dup_acks=0)
+    for line in out.splitlines():
+        f = line.split(",")
+        if len(f) < 3 + len(TSHARK_FLAGS):
+            continue
+        if f[0] == str(local_port):
+            if f[1] not in ("", "0"):
+                res["data_segments"] += 1
+                for i, name in enumerate(TSHARK_FLAGS):
+                    res[name] += f[2 + i] == "1"
+        elif f[2 + len(TSHARK_FLAGS)] == "1":
+            res["dup_acks"] += 1
+    n = res["data_segments"]
+    if n:
+        # tshark sets `retransmission` on fast and spurious retransmissions too
+        res["retrans_pct"] = round(100.0 * res["retransmission"] / n, 2)
+        res["ooo_pct"] = round(100.0 * res["out_of_order"] / n, 2)
+    return res
+
+
+def tshark_analyse(path, local_port):
+    """Wireshark's own TCP analysis of a capture: tells genuine retransmissions from out-of-order
+    arrivals (which analyse_pcap can't), and flags segments the capture itself missed."""
+    if not shutil.which("tshark"):
+        return {}
+    cmd = (["tshark", "-r", path, "-n", "-T", "fields", "-E", "separator=,", "-E", "occurrence=f",
+            "-e", "tcp.dstport", "-e", "tcp.len"]
+           + [x for f in TSHARK_FLAGS + ("duplicate_ack",) for x in ("-e", f"tcp.analysis.{f}")])
+    rc, out, err = run(cmd, timeout=120)
+    if rc != 0:
+        return {"error": (err or f"tshark rc={rc}")[-200:]}
+    return parse_tshark_fields(out, local_port)
+
+
+# ---------------------------------------------------------------- MDA traceroute (scamper tracelb)
+
+def parse_tracelb(obj):
+    """A version-independent view of one scamper tracelb result. Rather than rely on how a scamper
+    version groups nodes and links, collect every answered probe's TTL and flow id under the address
+    that answered it. Returns hops (per TTL: addresses and how many probe flows reached each)."""
+    by_ttl = {}
+
+    def walk(x):
+        if isinstance(x, dict):
+            if "addr" in x and isinstance(x.get("probes"), list):
+                for p in x["probes"]:
+                    if "ttl" in p and (p.get("replyc") or p.get("replies")):
+                        by_ttl.setdefault(int(p["ttl"]), {}).setdefault(x["addr"], set()).add(p.get("flowid"))
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+
+    walk(obj.get("nodes", []))
+    seen = {a for t in by_ttl.values() for a in t}
+    first = int(obj.get("firsthop", 1))
+    for n in obj.get("nodes", []):              # nodes never seen as a reply: hops before the first probed TTL
+        if n.get("addr") and n["addr"] not in seen and first not in by_ttl:
+            by_ttl.setdefault(first, {})[n["addr"]] = set()
+    dst = obj.get("dst")
+    hops = [{"ttl": t, "addrs": [{"addr": a, "flows": len(f)} for a, f in sorted(by_ttl[t].items())]}
+            for t in sorted(by_ttl)]
+    lb = [h for h in hops if len([a for a in h["addrs"] if a["addr"] != dst]) > 1]
+    return {"dst": dst, "method": obj.get("method"), "dport": obj.get("dport"), "probes": obj.get("probec"),
+            "hops": hops, "lb_hops": [h["ttl"] for h in lb],
+            "width": max((len(h["addrs"]) for h in lb), default=1)}
+
+
+def run_tracelb(cap, ip, dport, method, timeout):
+    cmd = cap.prefix + ["scamper", "-O", "json", "-c", f"tracelb -P {method} -d {dport} -q 1 -w 1", "-i", ip]
+    rc, out, err = run(cmd, timeout=timeout)
+    for line in out.splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if obj.get("type") == "tracelb":
+            return obj, None
+    return None, (err or f"scamper rc={rc}, no tracelb result")[-200:]
+
+
+def mda_test(cap, thr_rows, families, args, meta, pdir):
+    """Enumerate the load-balanced paths to the destinations that matter most (most slow connections
+    first, plus every control) with scamper's Multipath Detection Algorithm."""
+    if not shutil.which("scamper"):
+        say("\n  -- MDA traceroute skipped: scamper not installed (brew install scamper)")
+        return {"skipped": "scamper not installed (brew install scamper)"}
+    if not cap.ok:
+        say(f"\n  -- MDA traceroute skipped: {cap.reason}")
+        return {"skipped": cap.reason}
+    slow = {}
+    for r in thr_rows:
+        k = (trace_owner(r["target"], r["family"]), r["family"])
+        st = slow.setdefault(k, [0, 0])
+        st[0] += r["class"] == "slow"
+        st[1] += r["class"] in ("slow", "fast")
+    cands = []
+    for t in TARGETS:
+        for fam in families:
+            u = url_for(t, fam)
+            if not u or trace_owner(t[0], fam) != t[0]:
+                continue
+            ips = (meta.get("dns", {}).get(host_of(u)) or {}).get("AAAA" if fam == 6 else "A") or []
+            if not ips:
+                continue
+            sl, n = slow.get((t[0], fam), (0, 0))
+            port = urllib.parse.urlsplit(u).port or (443 if u.startswith("https") else 80)
+            cands.append((t[3] != "control", -(sl / n if n else 0), t[0], fam, ips[0], port))
+    cands.sort()
+    ctl = [c for c in cands if not c[0]]
+    jobs = (ctl + [c for c in cands if c[0]])[:max(args.mda_max * len(families), len(ctl))]
+    say(f"\n  -- MDA traceroute (scamper tracelb, {args.mda_method}) to {len(jobs)} destination(s)")
+    ui.section("MDA traceroute", len(jobs))
+    os.makedirs(os.path.join(pdir, "mda"), exist_ok=True)
+    out = []
+
+    def one(job):
+        _, _, name, fam, ip, port = job
+        obj, err = run_tracelb(cap, ip, port, args.mda_method, args.mda_timeout)
+        return job, obj, err
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        for job, obj, err in ex.map(one, jobs):
+            _, _, name, fam, ip, port = job
+            entry = {"target": name, "family": fam, "ip": ip, "dport": port}
+            if obj is None:
+                entry["error"] = err
+                say(f"     {name:<22} v{fam}  error: {err[:80]}")
+            else:
+                raw = os.path.join("mda", f"{name}-v{fam}.json")
+                with open(os.path.join(pdir, raw), "w") as fh:
+                    json.dump(obj, fh)
+                entry.update(parse_tracelb(obj), file=raw)
+                lbs = ", ".join(f"hop {h['ttl']}: " + " / ".join(a["addr"] for a in h["addrs"])
+                                for h in entry["hops"] if h["ttl"] in entry["lb_hops"])
+                say(f"     {name:<22} v{fam}  " + (f"load-balanced at {lbs}" if lbs else "no load balancing seen"))
+            out.append(entry)
+            ui.tick(detail=f"{name} v{fam}")
+    return {"method": args.mda_method, "results": out}
 
 
 # ---------------------------------------------------------------- one phase
@@ -1419,7 +1880,9 @@ def run_phase(phase_id, outdir, args, interactive, cap):
     families = {"4": [4], "6": [6] if have6 else [], "both": [4] + ([6] if have6 else [])}[args.family]
     meta = {"phase": phase_id, "title": ph["title"], "short": ph["short"], "started": now_iso(),
             "env": env, "families": families, "rounds": args.rounds, "seconds": args.seconds,
-            "slow_mbps": args.slow_mbps, "script_version": VERSION}
+            "slow_mbps": args.slow_mbps, "script_version": VERSION,
+            "targets": [list(t) for t in TARGETS], "port_test_target": PORT_TEST_TARGET,
+            "ix_source": IX_TABLE["source"]}
 
     jobs = [(t, fam) for t in TARGETS for fam in families if url_for(t, fam)]
     n_flows = len(jobs) * args.rounds
@@ -1427,14 +1890,15 @@ def run_phase(phase_id, outdir, args, interactive, cap):
     say(f"\n  {n_flows} throughput connections plus the extra tests; about {int(est // 60)} min. "
         "Leave this computer alone while it runs.")
     trace_jobs = [] if args.no_trace else [(t, fam) for t in TARGETS for fam in families
-                                           if url_for(t, fam) and t[0] != "hetzner-ash-https"]
+                                           if url_for(t, fam) and trace_owner(t[0], fam) == t[0]]
     n_port = 0 if args.no_port_test else args.port_count * args.port_reps * len(families)
     n_pcap = 0 if (args.no_pcap or not cap.ok) else args.pcap_flows * len(families)
     n_ft = (0 if (args.no_flowtrace or args.no_port_test or not cap.ok or not scapy_available())
             else 2 * 2 * args.flowtrace_ports * len(families))
     n_long = 0 if args.no_long else args.long_count * len(families)
+    n_mda = 0 if (args.no_mda or not cap.ok or not shutil.which("scamper")) else args.mda_max * len(families)
     n_iperf = 0 if (args.no_iperf or not shutil.which("iperf3")) else args.iperf_max * 2 * len(families)
-    ui.phase_start(ph["short"], 2 * len(trace_jobs) + n_flows + n_port + n_ft + n_pcap + n_long + n_iperf)
+    ui.phase_start(ph["short"], 2 * len(trace_jobs) + n_flows + n_port + n_ft + n_mda + n_pcap + n_long + n_iperf)
     b0 = BUDGET.used
     try:
         _run_phase_tests(phase_id, pdir, outdir, env, families, jobs, trace_jobs, meta, args, cap)
@@ -1495,7 +1959,7 @@ def _run_phase_tests(phase_id, pdir, outdir, env, families, jobs, trace_jobs, me
         w = csv.DictWriter(fh, fieldnames=FLOW_FIELDS)
         w.writeheader()
 
-        port_rows = []
+        port_rows, thr_rows = [], []
 
         def record(rec, **kw):
             rec.update(phase=phase_id, time=now_iso(), **kw)
@@ -1504,6 +1968,8 @@ def _run_phase_tests(phase_id, pdir, outdir, env, families, jobs, trace_jobs, me
             fh.flush()
             if kw.get("test") == "fixed-port":
                 port_rows.append(rec)
+            elif kw.get("test") == "throughput":
+                thr_rows.append(rec)
             return {"slow": "  <-- SLOW", "error": "  <-- ERROR " + rec["error"][:50]}.get(rec["class"], "")
 
         for r in range(1, args.rounds + 1):
@@ -1535,6 +2001,8 @@ def _run_phase_tests(phase_id, pdir, outdir, env, families, jobs, trace_jobs, me
 
     if not args.no_flowtrace and not args.no_port_test:
         dump("flowtrace.json", flowtrace_test(cap, port_rows, families, args))
+    if not args.no_mda:
+        dump("mda.json", mda_test(cap, thr_rows, families, args, meta, pdir))
     if not args.no_pcap:
         dump("pcap.json", pcap_test(cap, phase_id, pdir, env, families, args))
     if not args.no_long:
@@ -1559,15 +2027,30 @@ def load_phase(pdir):
     for r in rows:
         r["mbps"] = float(r["mbps"] or 0)
         r["family"] = int(r["family"])
+        for f in TCP_FIELDS:
+            try:
+                r[f] = float(r[f]) if r.get(f) not in (None, "") else None
+            except ValueError:
+                r[f] = None
     out = {"meta": meta, "rows": rows, "traces": {}, "pings": {}, "pcap": {}, "long": [], "iperf": [],
-           "flowtrace": {}}
+           "flowtrace": {}, "mda": {}}
     for k, f in (("traces", "traceroutes.json"), ("pings", "pings.json"), ("pcap", "pcap.json"),
-                 ("long", "long.json"), ("iperf", "iperf.json"), ("flowtrace", "flowtrace.json")):
+                 ("long", "long.json"), ("iperf", "iperf.json"), ("flowtrace", "flowtrace.json"),
+                 ("mda", "mda.json")):
         p = os.path.join(pdir, f)
         if os.path.exists(p):
             with open(p) as fh:
                 out[k] = json.load(fh)
     return out
+
+
+def median_ooo(rows):
+    v = [r["tcp_ooo_pct"] for r in rows if r.get("tcp_ooo_pct") is not None]
+    return statistics.median(v) if v else 0.0
+
+
+def fmt_ms(v):
+    return f"{v:.1f}" if v < 10 else f"{v:.0f}"
 
 
 def stats_for(rows):
@@ -1704,6 +2187,32 @@ def analyse(phases):
                      f"{ds:.0f}% directly on the ISP router. "
                      + ("Similar, so the customer's router adds nothing to the problem." if abs(us - ds) <= 20 else
                         "The difference is worth noting."))
+    # kernel TCP statistics: slow vs fast connections to the same destination
+    for ph in res["phases"]:
+        thr = [r for r in ph["P"]["rows"] if r["test"] == "throughput" and r.get("tcp_rtt_ms") is not None]
+        pairs = []
+        for (tname, fam) in ph["per"]:
+            rs = [r for r in thr if r["target"] == tname and r["family"] == fam]
+            sl = [r for r in rs if r["class"] == "slow"]
+            fa = [r for r in rs if r["class"] == "fast"]
+            if len(sl) >= 2 and len(fa) >= 2:
+                pairs.append((tname, fam, statistics.median(r["tcp_rtt_ms"] for r in sl),
+                              statistics.median(r["tcp_rtt_ms"] for r in fa), median_ooo(sl), median_ooo(fa)))
+        if not pairs:
+            continue
+        L.append(f"Kernel TCP statistics ({ph['P']['meta']['short']}), median round-trip time seen by the receiving "
+                 "end, slow vs fast connections to the same destination: "
+                 + "; ".join(f"{t} v{f} {fmt_ms(a)} vs {fmt_ms(b)} ms" for t, f, a, b, _, _ in pairs) + ".")
+        longer = sum(1 for _, _, a, b, _, _ in pairs if a > 1.2 * b + 0.5)
+        if longer == len(pairs):
+            L.append("Slow connections consistently see a longer round trip than fast ones to the same server, so "
+                     "they are taking a different path, and that path adds delay (queueing or distance).")
+        elif longer == 0:
+            L.append("Round trips are about the same for slow and fast connections, so the slow path doesn't add "
+                     "delay; a rate limit or loss on it is more likely than congestion queueing.")
+        L.append("Out-of-order share of received data, slow vs fast (kernel counters): "
+                 + "; ".join(f"{t} v{f} {c:.1f}% vs {d:.1f}%" for t, f, _, _, c, d in pairs) + ".")
+
     v6 = [ph["agg"][("test", 6)] for ph in res["phases"] if (ph["agg"].get(("test", 6)) or {}).get("valid")]
     if v6 and any(s["slow"] for s in v6):
         L.append("IPv6 is affected as well as IPv4, so address translation (NAT/CGNAT) is not the cause.")
@@ -1760,9 +2269,10 @@ def analyse(phases):
             where = f"{ph['P']['meta']['short']}, IPv{fam}"
             if not rm["n_bad"]:
                 continue
-            desc = lambda n: (f"{n['ip']}" + (f" ({n['info'].get('rdns')})" if n["info"].get("rdns") else "")
-                              + (f" AS{n['info'].get('asn')} {n['info'].get('as_name', '').split(',')[0]}"
-                                 if n["info"].get("asn") else ""))
+            def desc(n):
+                return (f"{n['ip']}" + (f" ({n['info'].get('rdns')})" if n["info"].get("rdns") else "")
+                        + (f" AS{n['info'].get('asn')} {n['info'].get('as_name', '').split(',')[0]}"
+                           if n["info"].get("asn") else ""))
             if rm["on_every_bad"]:
                 L.append(f"Route map ({where}): {rm['n_bad']} bad and {rm['n_good']} good destinations. Routers on "
                          "EVERY bad route and on no good route: " + "; ".join(desc(n) for n in rm["on_every_bad"][:4])
@@ -1800,6 +2310,41 @@ def analyse(phases):
                 L.append(f"  (Paths changed between repeats for port(s) {', '.join(map(str, fa['unstable_ports']))}: "
                          "routing may be shifting.)")
 
+    # MDA: load-balanced hops, cross-referenced with the suspects found above
+    for ph in res["phases"]:
+        mda = [m for m in (ph["P"]["mda"] or {}).get("results", []) if m.get("hops")]
+        if not mda:
+            continue
+        suspects = set()
+        for rm in (ph.get("routes") or {}).values():
+            suspects |= {n["ip"] for n in rm["suspects"]} | {n["ip"] for n in rm["on_every_bad"]}
+        for fa in (ph.get("flowtrace") or {}).values():
+            suspects |= set((fa.get("diverge") or {}).get("slow") or [])
+        lb = [m for m in mda if m["lb_hops"]]
+        where = ph["P"]["meta"]["short"]
+        if not lb:
+            L.append(f"MDA traceroute ({where}, scamper): no load balancing visible on the {len(mda)} route(s) "
+                     "enumerated. Any bundle on the bad path is inside a router (a LAG), where outside probes "
+                     "can't see its members.")
+            continue
+        desc = []
+        for m in lb:
+            hs = [h for h in m["hops"] if h["ttl"] in m["lb_hops"]]
+            desc.append(f"{m['target']} v{m['family']} at hop(s) "
+                        + ", ".join(f"{h['ttl']} ({len(h['addrs'])} paths)" for h in hs))
+        L.append(f"MDA traceroute ({where}, scamper) found load balancing towards: " + "; ".join(desc) + ".")
+        hits = []
+        for m in lb:
+            for h in m["hops"]:
+                addrs = {a["addr"] for a in h["addrs"]}
+                if h["ttl"] in m["lb_hops"] and addrs & suspects:
+                    hit = sorted(addrs & suspects)
+                    hits.append(f"{' and '.join(hit)} {'is one of' if len(hit) == 1 else 'are among the'} "
+                                f"{len(addrs)} parallel paths at hop {h['ttl']} towards {m['target']}")
+        if hits:
+            L.append("Suspect router(s) from the route map or the per-flow probes sit inside a load-balanced group: "
+                     + "; ".join(hits) + ". That fits a single faulty member of that group.")
+
     # path classification from traceroutes
     for ph in res["phases"]:
         tr = ph["P"]["traces"]
@@ -1831,6 +2376,25 @@ def analyse(phases):
         elif rs is not None and rs < 1 and med("slow", "stalls_200ms"):
             L.append("The slow connections show little retransmission but long gaps between segments. That "
                      "looks more like queueing or rate-limiting than packet loss.")
+        ts = [f for f in caps if (f.get("tshark") or {}).get("data_segments")]
+        if ts:
+            def tsum(cls):
+                g = [f["tshark"] for f in ts if f["class"] == cls]
+                if not g:
+                    return None
+                n = sum(x["data_segments"] for x in g)
+                return {k: sum(x.get(k, 0) for x in g) for k in TSHARK_FLAGS} | {"n": n, "count": len(g)}
+            bits = []
+            for cls in ("slow", "fast"):
+                t = tsum(cls)
+                if t and t["n"]:
+                    bits.append(f"{cls} ({t['count']} capture(s)): {100 * t['retransmission'] / t['n']:.1f}% of data "
+                                f"segments retransmitted ({t['spurious_retransmission']} spurious), "
+                                f"{100 * t['out_of_order'] / t['n']:.1f}% out of order, "
+                                f"{t['lost_segment']} gap(s) where the capture itself missed a segment")
+            if bits:
+                L.append("Wireshark's TCP analysis (tshark) of the same captures, which tells resent data from "
+                         "reordered data: " + "; ".join(bits) + ".")
         drops = [f for f in caps if f.get("kernel_drops")]
         if drops:
             L.append(f"Note: {len(drops)} capture(s) reported packets dropped by the kernel, so their counts are "
@@ -1966,12 +2530,12 @@ def route_map(ph, fam):
         if key.startswith("iperf:") or not key.endswith(f"/v{fam}") or not tr.get("hops"):
             continue
         tname = key.split("/")[0]
-        names = [tname] + (["hetzner-ash-https"] if tname == "hetzner-ash-http" else [])
+        names = [x[0] for x in TARGETS if trace_owner(x[0], fam) == tname] or [tname]
         st = stats_for([r for r in thr if r["target"] in names])
         if not st["valid"]:
             continue
         status = "bad" if st["slow_pct"] >= 15 else ("good" if st["slow_pct"] <= 5 else "mixed")
-        dests.append({"key": key, "name": "hetzner-ash (http+https)" if len(names) > 1 else tname,
+        dests.append({"key": key, "name": " + ".join(names),
                       "st": st, "status": status, "hops": tr["hops"], "via_ix": tr.get("via_ix")})
     if not dests:
         return None
@@ -2030,7 +2594,8 @@ def _badness_colour(frac):
     for (a, ca), (b, cb) in zip(stops, stops[1:]):
         if frac <= b:
             t = (frac - a) / (b - a) if b > a else 0
-            return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(ca, cb))
+            r, g, b = (round(x + (y - x) * t) for x, y in zip(ca, cb))
+            return f"#{r:02x}{g:02x}{b:02x}"
     return "#991b1b"
 
 
@@ -2167,6 +2732,7 @@ td.hopcell{font:11px ui-monospace,Menlo,monospace;white-space:nowrap}td.div{back
 
 
 def html_report(an, args):
+    slow_mbps = an["phases"][0]["P"]["meta"].get("slow_mbps", 3.0)    # the threshold the run used
     esc = html.escape
     first = an["phases"][0]["P"]["meta"]
     pub = first["env"].get("public_v4") or {}
@@ -2194,8 +2760,8 @@ def html_report(an, args):
     o.append("</ul></div>")
 
     o.append("<h2>Every connection</h2><p class='muted'>One dot per connection, log scale. Red is below the slow "
-             f"threshold. Green row labels are destinations whose route crossed a known internet exchange ({IX_LABEL}). Hover a dot for details.</p>")
-    o.append(f"<div class='card'>{svg_dotplot(an, args.slow_mbps)}</div>")
+             "threshold. Green row labels are destinations whose route crossed a known internet exchange. Hover a dot for details.</p>")
+    o.append(f"<div class='card'>{svg_dotplot(an, slow_mbps)}</div>")
 
     o.append("<h2>Results by vantage point and target</h2><table><tr><th>Vantage point</th><th>Target</th>"
              "<th>Family</th><th>Route</th><th class='n'>Slow</th><th class='n'>Median fast MB/s</th>"
@@ -2209,6 +2775,33 @@ def html_report(an, args):
                      f"<td class='n'>{num(s['med_fast'], '.1f')}</td><td class='n'>{num(s['max_fast'], '.1f')}</td>"
                      f"<td class='n'>{num(s['med_slow'], '.2f')}</td><td class='n'>{s['err']}</td></tr>")
     o.append("</table>")
+
+    tcp_rows = []
+    for ph in an["phases"]:
+        thr = [r for r in ph["P"]["rows"] if r["test"] == "throughput" and r.get("tcp_rtt_ms") is not None]
+        for (tname, fam) in ph["per"]:
+            rs = [r for r in thr if r["target"] == tname and r["family"] == fam]
+            if not rs:
+                continue
+            cell = []
+            for cls in ("slow", "fast"):
+                g = [r for r in rs if r["class"] == cls]
+                rt = [r["tcp_rtt_ms"] for r in g]
+                oo = [r["tcp_ooo_pct"] for r in g if r.get("tcp_ooo_pct") is not None]
+                cell += [str(len(g)), num(statistics.median(rt) if rt else None, ".1f"),
+                         num(statistics.median(oo) if oo else None, ".2f")]
+            tcp_rows.append((ph, tname, fam, cell))
+    if tcp_rows:
+        o.append("<h2>Kernel TCP statistics</h2><p class='muted'>Read from the operating system for each connection "
+                 "just before it closed: the receiving end's round-trip estimate (queueing on the data path raises "
+                 "it) and the share of received data that arrived out of order (by bytes on macOS, packets on "
+                 "Linux). Medians per class.</p><table><tr><th>Vantage point</th><th>Target</th><th>Fam</th>"
+                 "<th class='n'>Slow n</th><th class='n'>RTT ms</th><th class='n'>Out of order %</th>"
+                 "<th class='n'>Fast n</th><th class='n'>RTT ms</th><th class='n'>Out of order %</th></tr>")
+        for ph, tname, fam, c in tcp_rows:
+            o.append(f"<tr><td>{esc(ph['P']['meta']['short'])}</td><td>{esc(tname)}</td><td>v{fam}</td>"
+                     + "".join(f"<td class='n'>{esc(v)}</td>" for v in c) + "</tr>")
+        o.append("</table>")
 
     o.append("<h2>Fixed-source-port test</h2><p class='muted'>The same local source ports were re-used several "
              "times against one target. If a degraded bundle member is chosen by a hash of each connection's "
@@ -2242,14 +2835,18 @@ def html_report(an, args):
         o.append("<table><tr><th>Vantage point</th><th>Family</th><th>Local port</th><th>Class</th><th class='n'>MB/s</th>"
                  "<th class='n'>Server segments</th><th class='n'>Retransmitted</th><th class='n'>Holes</th>"
                  "<th class='n'>Dup ACKs</th><th class='n'>SACK ACKs</th><th class='n'>Stalls &gt;200 ms</th>"
-                 "<th class='n'>Longest gap ms</th><th>File</th></tr>")
+                 "<th class='n'>Longest gap ms</th><th class='n'>tshark: resent / out of order / missed</th>"
+                 "<th>File</th></tr>")
         for ph, f in cap_rows:
             o.append(f"<tr><td>{esc(ph['P']['meta']['short'])}</td><td>IPv{f['family']}</td><td><code>{f['local_port']}</code></td>"
                      f"<td class='{'bad' if f['class'] == 'slow' else 'ok'}'>{f['class']}</td><td class='n'>{f['mbps']:.2f}</td>"
                      f"<td class='n'>{f['server_segments']}</td><td class='n'>{f['retransmits']} ({num(f['retransmit_pct'], '.1f')}%)</td>"
                      f"<td class='n'>{f['holes']}</td><td class='n'>{f['dup_acks']}</td><td class='n'>{f['sack_acks']}</td>"
                      f"<td class='n'>{f['stalls_200ms']}</td><td class='n'>{f['longest_gap_ms']:.0f}</td>"
-                     f"<td><code>{esc(ph['id'] + '/' + f.get('file', ''))}</code></td></tr>")
+                     + (f"<td class='n'>{f['tshark']['retransmission']} / {f['tshark']['out_of_order']} / "
+                        f"{f['tshark']['lost_segment']}</td>" if (f.get("tshark") or {}).get("data_segments")
+                        else "<td class='n'>-</td>")
+                     + f"<td><code>{esc(ph['id'] + '/' + f.get('file', ''))}</code></td></tr>")
         o.append("</table>")
 
     # 5. long-running connections
@@ -2265,7 +2862,7 @@ def html_report(an, args):
         for ph, f in longs:
             o.append(f"<tr><td>{esc(ph['P']['meta']['short'])}</td><td>IPv{f['family']}</td>"
                      f"<td class='{'bad' if f['class'] == 'slow' else 'ok'}'>{f['class']}</td>"
-                     f"<td class='n'>{f['mbps']:.2f}</td><td>{svg_spark(f['series_mbps'], args.slow_mbps)}</td></tr>")
+                     f"<td class='n'>{f['mbps']:.2f}</td><td>{svg_spark(f['series_mbps'], slow_mbps)}</td></tr>")
         o.append("</table>")
 
     # 3. parallel streams
@@ -2317,6 +2914,40 @@ def html_report(an, args):
         o.append(f"<details{' open' if i == 0 else ''}><summary>{title}</summary>"
                  f"<div class='card'>{svg_route_map(rm)}</div></details>")
 
+    # MDA traceroute
+    o.append("<h2>Load-balanced paths (MDA)</h2><p class='muted'>scamper's Multipath Detection Algorithm varies the "
+             "flow identifier of its probes until it has found, with 95% confidence, every path a load balancer "
+             "can send a flow down. Hops with more than one address are load-balanced (ECMP); the number after "
+             "each address is how many probe flows reached it. Suspects from the route map and per-flow probes "
+             "are marked.</p>")
+    any_mda = False
+    for ph in an["phases"]:
+        md = ph["P"]["mda"] or {}
+        sus = set()
+        for rm in (ph.get("routes") or {}).values():
+            sus |= {n["ip"] for n in rm["suspects"]} | {n["ip"] for n in rm["on_every_bad"]}
+        for m in md.get("results", []):
+            if not m.get("hops"):
+                if m.get("error"):
+                    o.append(f"<p class='muted'>{esc(ph['P']['meta']['short'])} · {esc(m['target'])} v{m['family']}: "
+                             f"{esc(m['error'])}</p>")
+                continue
+            any_mda = True
+            o.append(f"<details{' open' if m['lb_hops'] else ''}><summary>{esc(ph['P']['meta']['short'])} · "
+                     f"{esc(m['target'])} v{m['family']} — "
+                     + (f"load-balanced at hop(s) {', '.join(map(str, m['lb_hops']))}, up to {m['width']} paths"
+                        if m["lb_hops"] else "no load balancing seen")
+                     + "</summary><table><tr><th>Hop</th><th>Addresses (probe flows)</th></tr>")
+            for h in m["hops"]:
+                cells = " · ".join(f"<code>{esc(a['addr'])}</code> ({a['flows']})"
+                                   + (" <b class='bad'>suspect</b>" if a["addr"] in sus else "") for a in h["addrs"])
+                o.append(f"<tr><td{' class=div' if h['ttl'] in m['lb_hops'] else ''}>{h['ttl']}</td><td>{cells}</td></tr>")
+            o.append("</table></details>")
+        if md.get("skipped"):
+            o.append(f"<p class='muted'>{esc(ph['P']['meta']['short'])}: not run — {esc(md['skipped'])}.</p>")
+    if not any_mda and not any((ph["P"]["mda"] or {}).get("skipped") for ph in an["phases"]):
+        o.append("<p class='muted'>Not run.</p>")
+
     # per-flow path probes
     o.append("<h2>Per-flow path probes</h2><p class='muted'>TCP traceroutes sent with exactly the same addresses "
              "and ports as connections that were consistently slow or consistently fast in the fixed-port test "
@@ -2351,8 +2982,8 @@ def html_report(an, args):
 
     o.append("<h2>Paths</h2><p class='muted'>Traceroutes (three probes per hop; extra addresses at a hop are parallel paths) with reverse DNS and origin AS "
              "(Team Cymru) for public hops, plus ping to each destination. Hops inside a known internet-exchange "
-             f"peering LAN ({IX_LABEL}) are flagged. The HTTPS Hetzner target shares the HTTP one's host and "
-             "path.</p>")
+             f"peering LAN (exchange list: {esc(ix_source(an))}) are flagged. Targets on the same host share "
+             "one traceroute.</p>")
     for ph in an["phases"]:
         o.append(f"<h3>{esc(ph['P']['meta']['title'])}</h3>")
         if not ph["P"]["traces"]:
@@ -2365,7 +2996,8 @@ def html_report(an, args):
                      "</summary><table><tr><th>#</th><th>Address</th><th>Reverse DNS</th><th>AS</th><th>AS name</th>"
                      "<th class='n'>RTT ms</th></tr>")
             for h in tr.get("hops", []):
-                ixt = f" <b class='ok'>[{esc(h['ix'])}]</b>" if h.get("ix") else ""
+                ixt = (f" <b class='ok'>[{esc(h['ix'])}{(' → ' + esc(member_label(h))) if member_label(h) else ''}]</b>"
+                   if h.get("ix") else "")
                 alts = "".join(f"<br><code>{esc(a['ip'])}</code> <span class='muted'>{esc(a.get('rdns') or '')}</span>"
                                for a in h.get("alts") or [])
                 o.append(f"<tr><td>{h['hop']}</td><td><code>{esc(h.get('ip') or '*')}</code>{ixt}{alts}</td>"
@@ -2440,15 +3072,19 @@ summary.txt     Plain-text summary table and analysis.
 message.txt     The covering message, with the automatic analysis at the bottom.
 <phase>/        One folder per vantage point:
   flows.csv         every connection: time, target, IP family, remote IP, local port,
-                    timings (connect / TLS / first byte / total), bytes, MB/s, class
+                    timings (connect / TLS / first byte / total), bytes, MB/s, class,
+                    and the kernel's TCP statistics (tcp_rtt_ms = receive-side RTT,
+                    tcp_ooo_pct = share of data that arrived out of order)
   traceroutes.json  hops with reverse DNS and origin AS
   pings.json        ICMP loss and RTT per target
   pcap/*.pcap       header-only packet captures (open in Wireshark): every slow
                     capture plus one fast one, named v<family>-port<local port>-<class>
-  pcap.json         per-capture loss analysis (retransmits, holes, SACKs, stalls)
+  pcap.json         per-capture loss analysis (retransmits, holes, SACKs, stalls), plus
+                    tshark's classification (retransmission / out of order / not captured)
   long.json         long-running connections, throughput per second
   iperf.json        parallel-stream tests: per-stream throughput and retransmits
   flowtrace.json    per-flow TCP traceroutes from the slow and fast source ports
+  mda.json, mda/    scamper MDA traceroutes: every load-balanced path, raw JSON in mda/
   meta.json         environment: gateway, interface, link speed, Wi-Fi details,
                     public IPs, target DNS, test parameters
 
@@ -2475,11 +3111,16 @@ def build_report(outdir, args):
     if not phases:
         say("No completed phases to report on.")
         return None
+    global PORT_TEST_TARGET
+    recorded = phases[0][1]["meta"]
+    if recorded.get("targets"):                 # analyse with the targets that run actually used
+        TARGETS[:] = [tuple(t) for t in recorded["targets"]]
+        PORT_TEST_TARGET = recorded.get("port_test_target", PORT_TEST_TARGET)
     an = analyse(phases)
     base = os.path.basename(os.path.abspath(outdir))
     zipname = f"{base}.zip"
     files = {"report.html": html_report(an, args),
-             "summary.txt": summary_table(an) + "\n\nAnalysis\n--------\n" + "\n".join(f"- {l}" for l in an["lines"]) + "\n",
+             "summary.txt": summary_table(an) + "\n\nAnalysis\n--------\n" + "\n".join(f"- {line}" for line in an["lines"]) + "\n",
              "message.txt": message_text(an, args, zipname),
              "README.txt": README}
     for name, content in files.items():
@@ -2506,6 +3147,29 @@ def build_report(outdir, args):
 
 
 # ---------------------------------------------------------------- main
+
+def load_targets_file(path):
+    """Targets from JSON: {"targets": [{"name", "url4", "url6", "role", "note"}], "port_test_target": name}
+    (or just the list). role is test, control or probe; url4 or url6 may be null."""
+    with open(path) as fh:
+        j = json.load(fh)
+    items = j["targets"] if isinstance(j, dict) else j
+    out = []
+    for t in items:
+        role = t.get("role", "test")
+        if role not in ("test", "control", "probe"):
+            raise ValueError(f"target {t.get('name')}: role must be test, control or probe")
+        if not t.get("name") or not (t.get("url4") or t.get("url6")):
+            raise ValueError(f"target {t}: needs a name and url4 and/or url6")
+        out.append((t["name"], t.get("url4"), t.get("url6"), role, t.get("note", "")))
+    tests = [t[0] for t in out if t[3] == "test"]
+    if not tests:
+        raise ValueError("at least one target needs role 'test'")
+    port = (j.get("port_test_target") if isinstance(j, dict) else None) or tests[0]
+    if port not in [t[0] for t in out]:
+        raise ValueError(f"port_test_target {port!r} is not a target")
+    return out, port
+
 
 def choose_phases(args, interactive):
     m2, m1 = phase_seconds(args, 2) / 60, phase_seconds(args, 1) / 60
@@ -2544,6 +3208,8 @@ def main():
                     help="comma list from: own-wired, own-wifi, isp-wifi, isp-wired, or own / isp for both "
                          "of a side (default: ask; non-interactive runs use isp-wired)")
     ap.add_argument("--targets", default=None, help="comma list of target names to use (default: all)")
+    ap.add_argument("--targets-file", default=None, metavar="FILE",
+                    help="replace the built-in targets with a JSON file (see docs/DEVELOPMENT.md)")
     ap.add_argument("--rounds", type=int, default=16, help="connections per target per family (default 16)")
     ap.add_argument("--seconds", type=int, default=5, help="length of each connection sample (default 5)")
     ap.add_argument("--slow-mbps", type=float, default=3.0, help="slow threshold in MB/s (default 3)")
@@ -2556,6 +3222,16 @@ def main():
     ap.add_argument("--flowtrace-ports", type=int, default=4, help="slow and fast ports to trace each (default 4)")
     ap.add_argument("--no-trace", action="store_true", help="skip traceroutes and pings")
     ap.add_argument("--no-pcap", action="store_true", help="skip the packet-capture test (needs sudo)")
+    ap.add_argument("--no-tshark", action="store_true", help="don't cross-check captures with tshark")
+    ap.add_argument("--no-mda", action="store_true", help="skip the MDA traceroute (scamper, needs sudo)")
+    ap.add_argument("--mda-max", type=int, default=4, help="destinations per family for MDA (default 4)")
+    ap.add_argument("--mda-method", default="tcp-sport",
+                    choices=["tcp-sport", "udp-dport", "udp-sport", "icmp-echo", "tcp-ack-sport"],
+                    help="scamper tracelb probe method (default tcp-sport: varies the TCP source port, like "
+                         "real connections)")
+    ap.add_argument("--mda-timeout", type=int, default=240, help="seconds per MDA trace (default 240)")
+    ap.add_argument("--no-peeringdb", action="store_true",
+                    help="don't fetch exchange data from PeeringDB; use the cache or built-in list")
     ap.add_argument("--pcap-flows", type=int, default=10, help="max captured downloads per family (default 10)")
     ap.add_argument("--pcap-keep-slow", type=int, default=3, help="stop once this many slow ones are captured")
     ap.add_argument("--pcap-seconds", type=int, default=4, help="length of each captured download (default 4)")
@@ -2602,6 +3278,12 @@ def main():
     if args.report_only:
         build_report(args.report_only, args)
         return
+    global PORT_TEST_TARGET
+    if args.targets_file:
+        try:
+            TARGETS[:], PORT_TEST_TARGET = load_targets_file(args.targets_file)
+        except (OSError, ValueError, KeyError) as e:
+            sys.exit(f"--targets-file: {e}")
     if not shutil.which("curl"):
         sys.exit("curl not found")
     if platform.system() != "Darwin":
@@ -2610,9 +3292,10 @@ def main():
     interactive = sys.stdin.isatty() and not args.yes
     if args.targets:
         keep = {x.strip() for x in args.targets.split(",")}
-        unknown = keep - set(TARGET_NAMES)
+        names = [t[0] for t in TARGETS]
+        unknown = keep - set(names)
         if unknown:
-            sys.exit(f"unknown target(s): {', '.join(sorted(unknown))}. Choose from: {', '.join(TARGET_NAMES)}")
+            sys.exit(f"unknown target(s): {', '.join(sorted(unknown))}. Choose from: {', '.join(names)}")
         keep |= {t[0] for t in TARGETS if t[3] == "control"} | {PORT_TEST_TARGET}   # controls + extra-test target
         TARGETS[:] = [t for t in TARGETS if t[0] in keep]
     if args.phases is None:
@@ -2641,7 +3324,12 @@ def main():
         say("  (tip: run with `uv run` for progress bars — it installs Rich automatically)")
     if not args.no_iperf and not shutil.which("iperf3"):
         say("  iperf3 not found: the parallel-stream test will be skipped (brew install iperf3 to include it).")
-    needs_raw = not args.no_pcap or not (args.no_flowtrace or args.no_port_test)
+    load_ix_table(use_pdb=not args.no_peeringdb)
+    say(f"  Exchanges: {IX_TABLE['source']}")
+    tools = [f"{t}: {'yes' if shutil.which(t) else 'no'}" for t in ("tshark", "scamper", "iperf3")]
+    say(f"  Optional tools: {', '.join(tools)}")
+    needs_raw = (not args.no_pcap or not (args.no_flowtrace or args.no_port_test)
+                 or (not args.no_mda and bool(shutil.which("scamper"))))
     cap = Capture(interactive, needs_raw)        # one sudo prompt covers captures and path probes
     if not cap.ok and needs_raw:
         say(f"  raw-packet access unavailable: {cap.reason}; packet captures and path probes will be skipped.")

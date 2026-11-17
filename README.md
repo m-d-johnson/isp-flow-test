@@ -1,5 +1,7 @@
 # isp-flow-test
 
+[![CI](https://github.com/m-d-johnson/isp-flow-test/actions/workflows/ci.yml/badge.svg)](https://github.com/m-d-johnson/isp-flow-test/actions/workflows/ci.yml)
+
 A guided, single-file test for one specific broadband fault: **some connections run at full
 speed while others crawl, and each connection stays in whichever state it started in.**
 It collects the evidence an ISP's network team needs and packs it into one zip for a support
@@ -26,6 +28,9 @@ whole life. Connections that land on the bad member are slow from start to finis
 This tool is built to show that pattern, rule out your own equipment, and narrow down where
 the bad path is. It can't fix it: only the operator of the faulty link can.
 
+CI runs it end to end in a network-namespace lab with a real ECMP split and one rate-limited
+member, and checks that it finds that member (see [Testing](docs/DEVELOPMENT.md#testing)).
+
 ## ⚠ Data volume
 
 **A default run on a fast line can download well over 100 GB per vantage point.** One run on a
@@ -43,18 +48,24 @@ Volume scales with how fast each connection runs, so slower lines move less.
 
 ## Requirements
 
-- **macOS.** The environment checks use `networksetup`, `ifconfig` and `system_profiler`. On
-  Linux the measurements work, but the checks don't, so you'll need `--force`.
+- **macOS.** The environment checks use `networksetup`, `ifconfig` and `system_profiler`. It
+  also runs on Linux (CI tests it there), but the Wi-Fi and link checks don't, so use `--force`.
 - `curl`, `traceroute`, `traceroute6`, `ping`, `ping6`, `whois` and `tcpdump`. All are built
   into macOS.
 - [uv](https://docs.astral.sh/uv/) (recommended). `uv run` reads the script's inline
-  metadata (PEP 723) and installs the two optional Python packages:
+  metadata (PEP 723) and installs its Python packages:
   - [Rich](https://github.com/Textualize/rich): the progress display (plain text without it);
-  - [scapy](https://scapy.net): the per-flow path probes (skipped without it).
+  - [scapy](https://scapy.net): the per-flow path probes (skipped without it);
+  - [truststore](https://github.com/sethmlarson/truststore) or
+    [certifi](https://github.com/certifi/python-certifi): certificate checks for HTTPS targets.
+    A uv-managed Python often can't find the system's certificates on its own.
 - Python 3.9 or newer.
-- Optional: `iperf3` (`brew install iperf3`) for the parallel-stream test.
-- Optional: `sudo` once per run, for the packet captures and path probes. Without it those
-  two tests are skipped and the rest still run.
+- Optional tools, each adding a test or a cross-check (the run says which it found):
+  - `iperf3` (`brew install iperf3`): the parallel-stream test;
+  - **scamper** (`brew install scamper`): the MDA traceroute;
+  - **tshark** (`brew install wireshark`): Wireshark's own analysis of each capture.
+- Optional: `sudo` once per run, for the packet captures, per-flow path probes and MDA
+  traceroute. Without it those tests are skipped and the rest still run.
 
 ## Quick start
 
@@ -100,12 +111,14 @@ Each vantage point gets the full set of tests below.
 | Test | What it shows | Needs |
 |---|---|---|
 | **Per-connection throughput** | 16 rounds of fresh, sequential 5-second downloads, rotated across all targets so changes over time affect each one equally. Each connection is classed fast or slow (default threshold 3 MB/s). | — |
+| **Kernel TCP statistics** | For every connection, the operating system's own round-trip estimate and out-of-order share, read just before it closes. A slow member that queues shows up as a longer round trip on the slow connections only. | — |
 | **Fixed-source-port test** | Reuses the same 8 local ports 3 times each. If outcomes stick to the port far more often than chance (exact Poisson-binomial p-value), the fault follows a flow hash. | — |
 | **Per-flow path probes** | TCP traceroutes sent from the consistently slow and fast source ports, holding all four address-and-port fields constant (Paris-traceroute style), so each router hashes each probe like the real connection. Shows the hop where slow and fast paths part. | sudo, scapy |
-| **Packet captures** | Header-only `tcpdump` of single downloads, analysed for retransmissions, sequence holes, duplicate and SACK acks, zero windows and stalls. Slow captures and one fast one are kept as `.pcap`. | sudo |
+| **MDA traceroute** | scamper's Multipath Detection Algorithm keeps varying the probe flow until it has found every path a load balancer can choose, with 95% confidence. Shows which hops are load-balanced and whether the suspects sit inside such a group. | sudo, scamper |
+| **Packet captures** | Header-only `tcpdump` of single downloads, analysed for retransmissions, sequence holes, duplicate and SACK acks, zero windows and stalls, and cross-checked by tshark, which tells resent data from reordered data. Slow captures and one fast one are kept as `.pcap`. | sudo (tshark optional) |
 | **Long connections** | 30-second downloads sampled every second, to see whether a slow connection ever recovers. | — |
 | **Parallel streams** | `iperf3` with 16 streams in each direction against public servers: how many streams of one test land slow. | iperf3 |
-| **Traceroutes and pings** | 3 probes per hop, reverse DNS, origin AS (Team Cymru), internet-exchange hops flagged, ping loss and RTT. | — |
+| **Traceroutes and pings** | 3 probes per hop, reverse DNS, origin AS (Team Cymru), ping loss and RTT. Hops on any exchange's peering LAN worldwide are flagged (from [PeeringDB](https://www.peeringdb.com)), with the network that owns that router. | — |
 | **Route map** | Merges the traceroutes into a graph and colours each router by the share of slow connections through it. Routers on every bad route and no good route are the prime suspects. | — |
 
 ### Targets
@@ -120,8 +133,21 @@ Each vantage point gets the full set of tests below.
 | `ovh-rbx`, `hetzner-fsn` | probe | Roubaix (FR) and Falkenstein (DE) |
 
 How each target is reached isn't assumed: each run's traceroutes decide it. Results are grouped
-by whether a route crossed a known internet exchange. If you're outside the UK, swap the
-control and exchange prefixes for local ones; see [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
+by whether a route crossed an internet exchange.
+
+The built-in targets suit a UK line. Elsewhere, put your own in a JSON file and pass
+`--targets-file`. Include at least one `control` that your ISP reaches over a healthy path,
+such as a local exchange-peered network:
+
+```json
+{
+  "targets": [
+    {"name": "cdn", "url4": "https://example.com/1GB.bin", "url6": "https://example.com/1GB.bin", "role": "test"},
+    {"name": "local", "url4": "http://speedtest.example.net/1GB.bin", "url6": null, "role": "control"}
+  ],
+  "port_test_target": "cdn"
+}
+```
 
 ## The support pack
 
@@ -133,8 +159,10 @@ flow-report-20261117-160927/
   summary.txt     plain-text summary table and analysis
   message.txt     a draft covering message, with the automatic analysis at the bottom
   README.txt      explains every file, for the ISP's engineers
-  <phase>/        raw data per vantage point: flows.csv, traceroutes.json, pings.json,
-                  pcap/*.pcap, pcap.json, long.json, iperf.json, flowtrace.json, meta.json
+  <phase>/        raw data per vantage point: flows.csv (with kernel TCP statistics),
+                  traceroutes.json, pings.json, pcap/*.pcap, pcap.json, long.json,
+                  iperf.json, flowtrace.json, mda.json and mda/*.json (raw scamper
+                  output), meta.json
 flow-report-20261117-160927.zip
 ```
 
@@ -148,9 +176,14 @@ Read `message.txt` before sending it, and edit it to taste.
   your line as a whole.
 - **"Outcome STICKS to the source port"**: a flow hash is choosing the bad path. IPv6 is the
   stronger evidence, because IPv4 may cross NAT that rewrites ports.
+- **Slow connections with a longer kernel round trip** than fast ones to the same server: they
+  take a different path that adds delay, usually queueing behind a congested or rate-limited
+  member.
 - **Per-flow probes that part at hop N**: the bad path is behind the addresses listed at
   that hop. If they never part, the bad member is inside one bundle that traceroute can't see
   into, and only the operator can find it from interface counters.
+- **MDA shows the suspect inside a load-balanced group**: one member of that group is the
+  likely fault. MDA finding no load balancing points to a LAG inside a single router.
 - **IPv6 slow too**: rules out NAT and CGNAT.
 - **No slow connections**: fixed, or intermittent. Run it again at a different time of day
   before closing a ticket.
@@ -169,10 +202,14 @@ Read `message.txt` before sending it, and edit it to taste.
 | `--slow-mbps X` | 3.0 | slow threshold, MB/s |
 | `--family 4\|6\|both` | both | IP families |
 | `--targets LIST` | all | subset of targets (controls and the port-test target are always kept) |
+| `--targets-file FILE` | built-in | replace the targets with your own (format above) |
 | `--own-gateway IP`, `--isp-gateway IP` | — | assert each side's gateway address |
 | `--expect-isp TEXT` | — | require the public IPv4's organisation to contain TEXT, e.g. `AS64500` |
 | `--expect-link TEXT` | — | warn if a wired phase's link media lacks TEXT, e.g. `10G` |
-| `--no-port-test`, `--no-flowtrace`, `--no-pcap`, `--no-long`, `--no-iperf`, `--no-trace` | — | skip a test |
+| `--no-port-test`, `--no-flowtrace`, `--no-pcap`, `--no-long`, `--no-iperf`, `--no-trace`, `--no-mda` | — | skip a test |
+| `--no-tshark` | — | don't cross-check captures with tshark |
+| `--mda-max N`, `--mda-method M`, `--mda-timeout S` | 4, `tcp-sport`, 240 | MDA destinations per family (controls are always added), probe method, time limit per trace |
+| `--no-peeringdb` | — | don't fetch exchange data; use the cached copy or the built-in list |
 | `--port-count`, `--port-reps`, `--flowtrace-ports` | 8, 3, 4 | fixed-port and probe sizes |
 | `--pcap-flows`, `--pcap-keep-slow`, `--pcap-seconds` | 10, 3, 4 | capture sizes |
 | `--long-count`, `--long-seconds` | 4, 30 | long-connection test |
@@ -193,14 +230,21 @@ The pack is meant for your ISP. It contains:
 - traceroutes from your line;
 - your name, in `message.txt`.
 
-During a run, the script sends your public IP to [ipify](https://www.ipify.org) and
-[ipinfo.io](https://ipinfo.io), each traceroute hop's address to Team Cymru's whois service,
-and its download and iperf3 traffic to the target servers. Review the pack before posting it
-anywhere public.
+During a run, the script sends:
+
+- your public IP to [ipify](https://www.ipify.org) and [ipinfo.io](https://ipinfo.io);
+- each traceroute hop's address to Team Cymru's whois service;
+- the address of any hop on an exchange's peering LAN to PeeringDB;
+- its download and iperf3 traffic to the target servers.
+
+It also downloads PeeringDB's exchange list (about 2 MB) once a day into `~/.cache/isp-flow-test`.
+Set `PEERINGDB_API_KEY` to use your own PeeringDB key, or `--no-peeringdb` to skip it.
+
+Review the pack before posting it anywhere public.
 
 ## Limitations
 
-- Built and tested on macOS only.
+- Built for macOS. It runs on Linux too, but only partly checks the test machine's environment there.
 - Traceroutes show the typical path to each destination, not each connection's exact path.
   The per-flow probes close most of that gap, but routers that rate-limit ICMP or hide
   bundle members limit what any outside test can see.
@@ -208,8 +252,21 @@ anywhere public.
   every route passes straight through. That works when the ISP's hops answer from public
   address space, which is common on IPv6 and less so on IPv4. Where it can't tell, the
   "first external network" label may name the ISP's own backbone.
-- The default control assumes a UK line. Elsewhere, pick a local control (see
-  [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)).
+- The default control assumes a UK line. Elsewhere, pick a local control with `--targets-file`.
+- MDA and the per-flow probes see the path *to* each server. Downloads travel back along the
+  return path, which the networks on the way hash separately and can't be probed from your
+  end. The kernel statistics and captures describe the return path.
+
+## Releases
+
+Each [release](https://github.com/m-d-johnson/isp-flow-test/releases) attaches the script and
+its SHA-256 checksum:
+
+```sh
+curl -LO https://github.com/m-d-johnson/isp-flow-test/releases/latest/download/isp-flow-test.py
+curl -LO https://github.com/m-d-johnson/isp-flow-test/releases/latest/download/isp-flow-test.py.sha256
+shasum -a 256 -c isp-flow-test.py.sha256
+```
 
 ## Licence
 
@@ -217,8 +274,8 @@ anywhere public.
 
 ## Contributing
 
-See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the architecture, data formats and how to
-test changes.
+See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the architecture, data formats, tests and
+release process.
 
 Not affiliated with any ISP or equipment vendor. Test-server operators are named only to
 identify the servers.

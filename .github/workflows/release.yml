@@ -1,0 +1,38 @@
+name: Release
+
+# Push a tag matching the script's VERSION (e.g. v3.2.0) to publish a GitHub release with the
+# script and its SHA-256 checksum attached. CI must pass first.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the tag matches VERSION
+        run: |
+          v=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' isp-flow-test.py)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION $v in isp-flow-test.py"
+            exit 1
+          fi
+      - name: Checksum
+        run: sha256sum isp-flow-test.py > isp-flow-test.py.sha256
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
+          isp-flow-test.py isp-flow-test.py.sha256
