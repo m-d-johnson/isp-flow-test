@@ -1802,25 +1802,34 @@ def mda_test(cap, thr_rows, families, args, meta, pdir):
     def one(job):
         _, _, name, fam, ip, port = job
         obj, err = run_tracelb(cap, ip, port, args.mda_method, args.mda_timeout)
+        if obj is None and "privsep" in (err or ""):      # see below; a retry after the race succeeds
+            obj, err = run_tracelb(cap, ip, port, args.mda_method, args.mda_timeout)
         return job, obj, err
 
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        for job, obj, err in ex.map(one, jobs):
-            _, _, name, fam, ip, port = job
-            entry = {"target": name, "family": fam, "ip": ip, "dport": port}
-            if obj is None:
-                entry["error"] = err
-                say(f"     {name:<22} v{fam}  error: {err[:80]}")
-            else:
-                raw = os.path.join("mda", f"{name}-v{fam}.json")
-                with open(os.path.join(pdir, raw), "w") as fh:
-                    json.dump(obj, fh)
-                entry.update(parse_tracelb(obj), file=raw)
-                lbs = ", ".join(f"hop {h['ttl']}: " + " / ".join(a["addr"] for a in h["addrs"])
-                                for h in entry["hops"] if h["ttl"] in entry["lb_hops"])
-                say(f"     {name:<22} v{fam}  " + (f"load-balanced at {lbs}" if lbs else "no load balancing seen"))
-            out.append(entry)
-            ui.tick(detail=f"{name} v{fam}")
+    def results():
+        # The first trace runs alone: scamper's privilege separation creates its directory
+        # (/var/empty) on first use, and parallel first runs race to create it ("File exists").
+        if jobs:
+            yield one(jobs[0])
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            yield from ex.map(one, jobs[1:])
+
+    for job, obj, err in results():
+        _, _, name, fam, ip, port = job
+        entry = {"target": name, "family": fam, "ip": ip, "dport": port}
+        if obj is None:
+            entry["error"] = err
+            say(f"     {name:<22} v{fam}  error: {err[:80]}")
+        else:
+            raw = os.path.join("mda", f"{name}-v{fam}.json")
+            with open(os.path.join(pdir, raw), "w") as fh:
+                json.dump(obj, fh)
+            entry.update(parse_tracelb(obj), file=raw)
+            lbs = ", ".join(f"hop {h['ttl']}: " + " / ".join(a["addr"] for a in h["addrs"])
+                            for h in entry["hops"] if h["ttl"] in entry["lb_hops"])
+            say(f"     {name:<22} v{fam}  " + (f"load-balanced at {lbs}" if lbs else "no load balancing seen"))
+        out.append(entry)
+        ui.tick(detail=f"{name} v{fam}")
     return {"method": args.mda_method, "results": out}
 
 
