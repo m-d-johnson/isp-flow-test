@@ -1,0 +1,8 @@
+# test output
+flow-report-*/
+flow-report-*.zip
+# python
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
